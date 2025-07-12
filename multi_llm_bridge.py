@@ -6,6 +6,7 @@ Version: 5.2.0 (2025-01-11)
 Main script that orchestrates multiple LLMs with flexible architecture and advanced UI.
 Enhanced: Saves and loads LLM configuration for convenience
 NEW: Main LLM can call itself as a tool for fresh perspectives
+Fixed: Uses status line for tool execution and thinking messages
 
 Features:
 - Main LLM can query itself with loop prevention
@@ -491,178 +492,6 @@ class MultiLLMBridge:
         
         return {"success": False, "error": f"Unknown tool: {tool_name}"}
     
-    def _query_sub_llm(self, llm_type: LLMType, tool_input: Dict[str, Any]) -> Dict[str, Any]:
-        """Query a sub-LLM and handle the response (enhanced for self-calling)"""
-        prompt = tool_input.get('prompt', '')
-        temperature = tool_input.get('temperature', 0.7)
-        max_tokens = tool_input.get('max_tokens', 4096)
-        include_context = tool_input.get('include_context', False)
-        
-        # Check if this is a self-call
-        is_self_call = (llm_type == self.main_llm)
-        
-        # Debug logging
-        logger.info(f"Querying {'SELF' if is_self_call else 'sub'}-LLM: {llm_type.value}")
-        logger.info(f"Self-call depth: {self.self_call_depth}")
-        
-        # Check self-call depth limit
-        if is_self_call and self.self_call_depth >= self.max_self_call_depth:
-            logger.warning(f"Self-call depth limit reached: {self.self_call_depth}")
-            return {
-                "success": False, 
-                "error": f"Self-call depth limit ({self.max_self_call_depth}) reached to prevent deep recursion"
-            }
-        
-        # Get the correct interface
-        if is_self_call:
-            interface = self.main_interface
-        else:
-            if llm_type not in self.sub_llms:
-                logger.error(f"LLM type {llm_type.value} not found in sub_llms!")
-                return {"success": False, "error": f"Sub-LLM {llm_type.value} not available"}
-            interface = self.sub_llms[llm_type]
-        
-        logger.info(f"Using interface: {type(interface).__name__} for {llm_type.value}")
-        
-        # Update UI based on type
-        if isinstance(self.ui, MultiPaneUI):
-            if is_self_call:
-                self.ui.add_message("system", f"🔄 Self-querying {llm_type.value}...", "tool")
-            else:
-                self.ui.update_sub_pane(llm_type, query=prompt, status='processing')
-        elif isinstance(self.ui, MultiWindowUI):
-            target = llm_type if not is_self_call else self.main_llm
-            self.ui.add_line(target, f"\n{'🔄 Self-query' if is_self_call else '🔧 Receiving query'} from {self.main_llm.value}:")
-            self.ui.add_line(target, f"Prompt: {prompt}")
-            self.ui.add_line(target, "Processing...")
-        else:
-            action = "Self-querying" if is_self_call else "Querying"
-            self.ui.add_message("system", f"{action} {llm_type.value}...", "tool")
-        
-        self.ui.refresh_display()
-        
-        # Build messages
-        messages = []
-        
-        # For self-calls, add a special system message to prevent tool use
-        if is_self_call:
-            self.self_call_depth += 1
-            # Add anti-loop instruction
-            messages.append({
-                "role": "system",
-                "content": (
-                    "You are being called by yourself for a focused analysis. "
-                    "DO NOT use any tools in this response - provide a direct answer only. "
-                    "This prevents infinite loops. Focus on giving a clear, comprehensive response."
-                )
-            })
-        
-        if include_context and len(self.conversation_history) > 0:
-            # Include recent context
-            context_messages = self.conversation_history[-10:]  # Last 10 messages
-            messages.extend(context_messages)
-        
-        messages.append({"role": "user", "content": prompt})
-        
-        # Make the API call
-        logger.info(f"About to call {llm_type.value} using interface {type(interface).__name__} with model {config.SELECTED_MODELS.get(llm_type, 'unknown')}")
-        
-        # For self-calls, explicitly disable tools
-        if is_self_call:
-            result = interface.chat(
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                tools=None  # No tools for self-calls
-            )
-        else:
-            result = interface.chat(
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens
-            )
-        
-        # Reset self-call depth if this was a self-call
-        if is_self_call:
-            self.self_call_depth -= 1
-        
-        # Log which model was actually used
-        if result['success']:
-            actual_model = result.get('model', 'unknown')
-            logger.info(f"{'Self' if is_self_call else 'Sub'}-LLM {llm_type.value} responded using model: {actual_model}")
-        
-        # Process result
-        if result['success']:
-            # Extract text content
-            text_content = ""
-            for content_item in result['content']:
-                if isinstance(content_item, dict) and content_item.get('type') == 'text':
-                    text_content += content_item.get('text', '')
-            
-            # Update statistics
-            self.stats[llm_type]['message_count'] += 1
-            self.stats[llm_type]['tool_calls'] += 1
-            if is_self_call:
-                self.stats[llm_type]['self_calls'] += 1
-            
-            if 'usage' in result:
-                self.stats[llm_type]['input_tokens'] += result['usage'].get('input_tokens', 0)
-                self.stats[llm_type]['output_tokens'] += result['usage'].get('output_tokens', 0)
-            
-            # Calculate cost
-            model = config.SELECTED_MODELS.get(llm_type, '')
-            cost = interface.estimate_cost(
-                result['usage'].get('input_tokens', 0),
-                result['usage'].get('output_tokens', 0),
-                model
-            )
-            self.stats[llm_type]['total_cost'] += cost
-            
-            # Update UI
-            if is_self_call:
-                # For self-calls, update main window
-                if isinstance(self.ui, (MultiWindowUI, MultiPaneUI)):
-                    self.ui.add_message("system", f"🔄 Self-query completed", "tool")
-                    self.ui.add_message(llm_type.value, text_content, "assistant")
-            else:
-                # Regular sub-LLM update
-                if isinstance(self.ui, MultiPaneUI):
-                    self.ui.update_sub_pane(
-                        llm_type, 
-                        response=text_content, 
-                        status='complete',
-                        stats_update={
-                            'message_count': 1,
-                            'total_tokens': result['usage'].get('total_tokens', 0),
-                            'estimated_cost': cost
-                        }
-                    )
-                elif isinstance(self.ui, MultiWindowUI):
-                    self.ui.add_line(llm_type, f"\n✅ Response from {llm_type.value}:")
-                    self.ui.add_line(llm_type, text_content)
-                    self.ui.add_line(llm_type, f"\nTokens: {result['usage'].get('total_tokens', 0)}, Cost: ${cost:.4f}")
-                    self.ui.update_stats(llm_type,
-                        message_count=1,
-                        total_tokens=result['usage'].get('total_tokens', 0),
-                        estimated_cost=cost
-                    )
-            
-            logger.info(f"{llm_type.value} {'self-' if is_self_call else ''}response - Tokens: {result['usage'].get('total_tokens', 0)}, Cost: ${cost:.4f}")
-            return {"success": True, "content": text_content}
-            
-        else:
-            # Handle error
-            self.stats[llm_type]['errors'] += 1
-            error_msg = result.get('error', 'Unknown error')
-            
-            if isinstance(self.ui, MultiPaneUI) and not is_self_call:
-                self.ui.update_sub_pane(llm_type, response=f"Error: {error_msg}", status='error')
-            elif isinstance(self.ui, MultiWindowUI):
-                self.ui.add_line(llm_type, f"\n❌ Error: {error_msg}")
-            
-            logger.error(f"{llm_type.value} error: {error_msg}")
-            return result
-    
     def chat(self, user_message: str, maintain_history: bool = True) -> str:
         """Send a message to the main LLM with access to sub-LLMs"""
         # Build system prompt
@@ -681,9 +510,13 @@ class MultiLLMBridge:
             if not has_system and system_prompt:
                 messages.insert(0, {"role": "system", "content": system_prompt})
         
-        # Show thinking indicator
-        if isinstance(self.ui, (MultiWindowUI, MultiPaneUI)):
-            self.ui.add_message(self.main_llm.value, f"[{self.main_llm.value} thinking...]", "thinking")
+        # FIX: Show thinking indicator in status line
+        if hasattr(self.ui, 'set_status'):
+            self.ui.set_status(f"{self.main_llm.value} thinking...")
+        else:
+            # Fallback for UIs without status support
+            if isinstance(self.ui, (MultiWindowUI, MultiPaneUI)):
+                self.ui.add_message(self.main_llm.value, f"[{self.main_llm.value} thinking...]", "thinking")
         
         self.ui.refresh_display()
         
@@ -699,6 +532,10 @@ class MultiLLMBridge:
             try:
                 logger.info(f"Chat iteration {iteration} - Messages: {len(messages)}")
                 
+                # FIX: Update status for iteration
+                if hasattr(self.ui, 'set_status'):
+                    self.ui.set_status(f"Processing message (iteration {iteration})...")
+                
                 # Get response from main LLM
                 result = self.main_interface.chat(
                     messages=messages,
@@ -709,6 +546,9 @@ class MultiLLMBridge:
                 if not result['success']:
                     self.stats[self.main_llm]['errors'] += 1
                     error_msg = f"Error: {result['error']}"
+                    # FIX: Clear status on error
+                    if hasattr(self.ui, 'clear_status'):
+                        self.ui.clear_status()
                     self.ui.add_message(self.main_llm.value, error_msg, "error")
                     return error_msg
                 
@@ -759,6 +599,9 @@ class MultiLLMBridge:
                 
                 # If no tool calls, we're done
                 if not has_tool_calls:
+                    # FIX: Clear status when done
+                    if hasattr(self.ui, 'clear_status'):
+                        self.ui.clear_status()
                     break
                 
                 # Handle tool calls
@@ -784,12 +627,15 @@ class MultiLLMBridge:
                 for tool_call in result['tool_calls']:
                     logger.info(f"Executing tool: {tool_call['name']}")
                     
-                    # Show tool usage in UI
-                    self.ui.add_message(
-                        self.main_llm.value,
-                        f"Using tool: {tool_call['name']}",
-                        "tool"
-                    )
+                    # FIX: Show tool usage in status line
+                    if hasattr(self.ui, 'set_status'):
+                        self.ui.set_status(f"Executing tool: {tool_call['name']}")
+                    else:
+                        self.ui.add_message(
+                            self.main_llm.value,
+                            f"Using tool: {tool_call['name']}",
+                            "tool"
+                        )
                     self.ui.refresh_display()
                     
                     # Execute tool
@@ -800,6 +646,10 @@ class MultiLLMBridge:
                     
                     # Handle tool result based on LLM type
                     if self.main_llm == LLMType.CLAUDE:
+                        # FIX: Update status for tool result processing
+                        if hasattr(self.ui, 'set_status'):
+                            self.ui.set_status("Processing tool result...")
+                        
                         # Claude needs the tool result message added to the conversation
                         tool_result_message = {
                             "role": "user",
@@ -886,8 +736,15 @@ class MultiLLMBridge:
                 logger.error(f"Error in chat loop: {str(e)}", exc_info=True)
                 self.stats[self.main_llm]['errors'] += 1
                 error_msg = f"Error: {str(e)}"
+                # FIX: Clear status on error
+                if hasattr(self.ui, 'clear_status'):
+                    self.ui.clear_status()
                 self.ui.add_message(self.main_llm.value, error_msg, "error")
                 return error_msg
+        
+        # FIX: Clear status when complete
+        if hasattr(self.ui, 'clear_status'):
+            self.ui.clear_status()
         
         # Add final response to history if not already added
         if maintain_history and final_response:
@@ -909,6 +766,196 @@ class MultiLLMBridge:
             self.auto_save()
         
         return final_response
+    
+    def _query_sub_llm(self, llm_type: LLMType, tool_input: Dict[str, Any]) -> Dict[str, Any]:
+        """Query a sub-LLM and handle the response (enhanced for self-calling)"""
+        prompt = tool_input.get('prompt', '')
+        temperature = tool_input.get('temperature', 0.7)
+        max_tokens = tool_input.get('max_tokens', 4096)
+        include_context = tool_input.get('include_context', False)
+        
+        # Check if this is a self-call
+        is_self_call = (llm_type == self.main_llm)
+        
+        # Debug logging
+        logger.info(f"Querying {'SELF' if is_self_call else 'sub'}-LLM: {llm_type.value}")
+        logger.info(f"Self-call depth: {self.self_call_depth}")
+        
+        # Check self-call depth limit
+        if is_self_call and self.self_call_depth >= self.max_self_call_depth:
+            logger.warning(f"Self-call depth limit reached: {self.self_call_depth}")
+            return {
+                "success": False, 
+                "error": f"Self-call depth limit ({self.max_self_call_depth}) reached to prevent deep recursion"
+            }
+        
+        # Get the correct interface
+        if is_self_call:
+            interface = self.main_interface
+        else:
+            if llm_type not in self.sub_llms:
+                logger.error(f"LLM type {llm_type.value} not found in sub_llms!")
+                return {"success": False, "error": f"Sub-LLM {llm_type.value} not available"}
+            interface = self.sub_llms[llm_type]
+        
+        logger.info(f"Using interface: {type(interface).__name__} for {llm_type.value}")
+        
+        # FIX: Update UI with status instead of adding messages
+        if isinstance(self.ui, MultiPaneUI):
+            if is_self_call:
+                if hasattr(self.ui, 'set_status'):
+                    self.ui.set_status(f"Self-querying {llm_type.value}...")
+                else:
+                    self.ui.add_message("system", f"🔄 Self-querying {llm_type.value}...", "tool")
+            else:
+                self.ui.update_sub_pane(llm_type, query=prompt, status='processing')
+        elif isinstance(self.ui, MultiWindowUI):
+            target = llm_type if not is_self_call else self.main_llm
+            # Don't add these as regular messages
+            if hasattr(self.ui, 'set_status'):
+                self.ui.set_status(f"{'Self-query' if is_self_call else 'Query'} to {llm_type.value}: {prompt[:50]}...")
+            else:
+                self.ui.add_line(target, f"\n{'🔄 Self-query' if is_self_call else '🔧 Receiving query'} from {self.main_llm.value}:")
+                self.ui.add_line(target, f"Prompt: {prompt}")
+                self.ui.add_line(target, "Processing...")
+        else:
+            action = "Self-querying" if is_self_call else "Querying"
+            if hasattr(self.ui, 'set_status'):
+                self.ui.set_status(f"{action} {llm_type.value}...")
+            else:
+                self.ui.add_message("system", f"{action} {llm_type.value}...", "tool")
+        
+        self.ui.refresh_display()
+        
+        # Build messages
+        messages = []
+        
+        # For self-calls, add a special system message to prevent tool use
+        if is_self_call:
+            self.self_call_depth += 1
+            # Add anti-loop instruction
+            messages.append({
+                "role": "system",
+                "content": (
+                    "You are being called by yourself for a focused analysis. "
+                    "DO NOT use any tools in this response - provide a direct answer only. "
+                    "This prevents infinite loops. Focus on giving a clear, comprehensive response."
+                )
+            })
+        
+        if include_context and len(self.conversation_history) > 0:
+            # Include recent context
+            context_messages = self.conversation_history[-10:]  # Last 10 messages
+            messages.extend(context_messages)
+        
+        messages.append({"role": "user", "content": prompt})
+        
+        # Make the API call
+        logger.info(f"About to call {llm_type.value} using interface {type(interface).__name__} with model {config.SELECTED_MODELS.get(llm_type, 'unknown')}")
+        
+        # For self-calls, explicitly disable tools
+        if is_self_call:
+            result = interface.chat(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=None  # No tools for self-calls
+            )
+        else:
+            result = interface.chat(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
+        
+        # Reset self-call depth if this was a self-call
+        if is_self_call:
+            self.self_call_depth -= 1
+        
+        # Log which model was actually used
+        if result['success']:
+            actual_model = result.get('model', 'unknown')
+            logger.info(f"{'Self' if is_self_call else 'Sub'}-LLM {llm_type.value} responded using model: {actual_model}")
+        
+        # Process result
+        if result['success']:
+            # Extract text content
+            text_content = ""
+            for content_item in result['content']:
+                if isinstance(content_item, dict) and content_item.get('type') == 'text':
+                    text_content += content_item.get('text', '')
+            
+            # Update statistics
+            self.stats[llm_type]['message_count'] += 1
+            self.stats[llm_type]['tool_calls'] += 1
+            if is_self_call:
+                self.stats[llm_type]['self_calls'] += 1
+            
+            if 'usage' in result:
+                self.stats[llm_type]['input_tokens'] += result['usage'].get('input_tokens', 0)
+                self.stats[llm_type]['output_tokens'] += result['usage'].get('output_tokens', 0)
+            
+            # Calculate cost
+            model = config.SELECTED_MODELS.get(llm_type, '')
+            cost = interface.estimate_cost(
+                result['usage'].get('input_tokens', 0),
+                result['usage'].get('output_tokens', 0),
+                model
+            )
+            self.stats[llm_type]['total_cost'] += cost
+            
+            # FIX: Clear status after successful response
+            if hasattr(self.ui, 'clear_status'):
+                self.ui.clear_status()
+            
+            # Update UI
+            if is_self_call:
+                # For self-calls, update main window
+                if isinstance(self.ui, (MultiWindowUI, MultiPaneUI)):
+                    # Don't add "Self-query completed" message, just the response
+                    self.ui.add_message(llm_type.value, text_content, "assistant")
+            else:
+                # Regular sub-LLM update
+                if isinstance(self.ui, MultiPaneUI):
+                    self.ui.update_sub_pane(
+                        llm_type, 
+                        response=text_content, 
+                        status='complete',
+                        stats_update={
+                            'message_count': 1,
+                            'total_tokens': result['usage'].get('total_tokens', 0),
+                            'estimated_cost': cost
+                        }
+                    )
+                elif isinstance(self.ui, MultiWindowUI):
+                    self.ui.add_line(llm_type, f"\n✅ Response from {llm_type.value}:")
+                    self.ui.add_line(llm_type, text_content)
+                    self.ui.add_line(llm_type, f"\nTokens: {result['usage'].get('total_tokens', 0)}, Cost: ${cost:.4f}")
+                    self.ui.update_stats(llm_type,
+                        message_count=1,
+                        total_tokens=result['usage'].get('total_tokens', 0),
+                        estimated_cost=cost
+                    )
+            
+            logger.info(f"{llm_type.value} {'self-' if is_self_call else ''}response - Tokens: {result['usage'].get('total_tokens', 0)}, Cost: ${cost:.4f}")
+            return {"success": True, "content": text_content}
+            
+        else:
+            # Handle error
+            self.stats[llm_type]['errors'] += 1
+            error_msg = result.get('error', 'Unknown error')
+            
+            # FIX: Clear status on error
+            if hasattr(self.ui, 'clear_status'):
+                self.ui.clear_status()
+            
+            if isinstance(self.ui, MultiPaneUI) and not is_self_call:
+                self.ui.update_sub_pane(llm_type, response=f"Error: {error_msg}", status='error')
+            elif isinstance(self.ui, MultiWindowUI):
+                self.ui.add_line(llm_type, f"\n❌ Error: {error_msg}")
+            
+            logger.error(f"{llm_type.value} error: {error_msg}")
+            return result
     
     def _update_main_stats(self, usage: Dict[str, Any]):
         """Update main LLM statistics"""
