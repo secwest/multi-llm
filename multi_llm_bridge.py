@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Multi-LLM Bridge - Ultimate Edition with Configuration Persistence
-Version: 5.1.0 (2025-01-11)
+Multi-LLM Bridge - Ultimate Edition with Configuration Persistence and Self-Calling
+Version: 5.2.0 (2025-01-11)
 
 Main script that orchestrates multiple LLMs with flexible architecture and advanced UI.
 Enhanced: Saves and loads LLM configuration for convenience
+NEW: Main LLM can call itself as a tool for fresh perspectives
 
 Features:
+- Main LLM can query itself with loop prevention
 - Saves last used configuration (models, display mode, etc.)
 - Prompts to reuse previous configuration on startup
 - Any LLM can be the main AI (Claude, OpenAI, or Gemini)
@@ -52,7 +54,7 @@ except ImportError as e:
     sys.exit(1)
 
 # Version
-VERSION = "5.1.0"
+VERSION = "5.2.0"
 VERSION_DATE = "2025-01-11"
 
 # Configuration paths
@@ -259,7 +261,7 @@ def display_saved_configuration(config_data: Dict[str, Any]):
 
 
 class MultiLLMBridge:
-    """Universal bridge for multiple LLMs with multi-UI support"""
+    """Universal bridge for multiple LLMs with multi-UI support and self-calling"""
     
     def __init__(self, main_llm: LLMType, main_interface: LLMInterface, 
                  sub_llms: Dict[LLMType, LLMInterface], ui: BaseTerminalUI):
@@ -270,8 +272,13 @@ class MultiLLMBridge:
         self.conversation_history = []
         self.session_start = datetime.now()
         
+        # Track self-call depth to prevent deep recursion
+        self.self_call_depth = 0
+        self.max_self_call_depth = 2  # Allow up to 2 levels of self-calling
+        
         # Log the configuration
         logger.info(f"Bridge initialized - Main: {main_llm.value} ({type(main_interface).__name__})")
+        logger.info(f"  Self-calling: Enabled (max depth: {self.max_self_call_depth})")
         for llm_type, interface in sub_llms.items():
             logger.info(f"  Sub-LLM: {llm_type.value} ({type(interface).__name__})")
         
@@ -282,6 +289,7 @@ class MultiLLMBridge:
             'message_count': 0,
             'total_cost': 0.0,
             'tool_calls': 0,
+            'self_calls': 0,  # Track self-calls separately
             'errors': 0
         } for llm in [main_llm] + list(sub_llms.keys())}
         
@@ -295,9 +303,63 @@ class MultiLLMBridge:
         logger.info(f"Bridge initialized - Main: {main_llm.value}, Subs: {[llm.value for llm in sub_llms.keys()]}")
     
     def _build_tools(self) -> List[Dict[str, Any]]:
-        """Build tool definitions for available sub-LLMs"""
+        """Build tool definitions for available sub-LLMs AND the main LLM itself"""
         tools = []
         
+        # First, add the main LLM as a tool (self-calling)
+        main_supports_tools = self.main_interface.supports_tools()
+        
+        tool_name = f"query_{self.main_llm.value}"
+        description = (
+            f"Query yourself ({self.main_llm.value.upper()}) with a fresh context. "
+            f"Useful for: getting a different perspective on your own reasoning, "
+            f"summarizing complex thoughts, breaking down problems, or starting fresh analysis. "
+            f"Note: Self-queries will not have access to tools to prevent loops."
+        )
+        
+        logger.info(f"Building self-calling tool: {tool_name}")
+        
+        tools.append({
+            "name": tool_name,
+            "description": description,
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "A clear, self-contained prompt for fresh analysis"
+                    },
+                    "temperature": {
+                        "type": "number",
+                        "description": "Sampling temperature (0-2)",
+                        "default": 0.7
+                    },
+                    "max_tokens": {
+                        "type": "integer",
+                        "description": "Maximum tokens in response",
+                        "default": 4096
+                    },
+                    "include_context": {
+                        "type": "boolean",
+                        "description": "Include conversation context (usually false for fresh perspective)",
+                        "default": False
+                    }
+                },
+                "required": ["prompt"]
+            }
+        })
+        
+        # Add model info tool for self
+        tools.append({
+            "name": f"get_{self.main_llm.value}_info",
+            "description": f"Get information about your current model configuration",
+            "input_schema": {
+                "type": "object",
+                "properties": {}
+            }
+        })
+        
+        # Then add tools for sub-LLMs
         for llm_type, interface in self.sub_llms.items():
             # Check if the interface supports tools
             supports_tools = interface.supports_tools()
@@ -389,7 +451,11 @@ class MultiLLMBridge:
             
             logger.info(f"Mapped to LLMType: {llm_type}")
             
-            if llm_type not in self.sub_llms:
+            # Check if this is a self-call or regular sub-LLM call
+            if llm_type == self.main_llm:
+                logger.info("Detected self-call")
+                return self._query_sub_llm(llm_type, tool_input)
+            elif llm_type not in self.sub_llms:
                 logger.error(f"LLMType {llm_type} not in sub_llms: {list(self.sub_llms.keys())}")
                 return {"success": False, "error": f"LLM {llm_name} not available as sub-LLM"}
             
@@ -426,39 +492,71 @@ class MultiLLMBridge:
         return {"success": False, "error": f"Unknown tool: {tool_name}"}
     
     def _query_sub_llm(self, llm_type: LLMType, tool_input: Dict[str, Any]) -> Dict[str, Any]:
-        """Query a sub-LLM and handle the response"""
+        """Query a sub-LLM and handle the response (enhanced for self-calling)"""
         prompt = tool_input.get('prompt', '')
         temperature = tool_input.get('temperature', 0.7)
         max_tokens = tool_input.get('max_tokens', 4096)
         include_context = tool_input.get('include_context', False)
         
-        # Debug logging
-        logger.info(f"Querying sub-LLM: {llm_type.value}")
-        logger.info(f"Available sub-LLMs: {list(self.sub_llms.keys())}")
+        # Check if this is a self-call
+        is_self_call = (llm_type == self.main_llm)
         
-        # Check if the LLM type is actually in our sub_llms
-        if llm_type not in self.sub_llms:
-            logger.error(f"LLM type {llm_type.value} not found in sub_llms!")
-            return {"success": False, "error": f"Sub-LLM {llm_type.value} not available"}
+        # Debug logging
+        logger.info(f"Querying {'SELF' if is_self_call else 'sub'}-LLM: {llm_type.value}")
+        logger.info(f"Self-call depth: {self.self_call_depth}")
+        
+        # Check self-call depth limit
+        if is_self_call and self.self_call_depth >= self.max_self_call_depth:
+            logger.warning(f"Self-call depth limit reached: {self.self_call_depth}")
+            return {
+                "success": False, 
+                "error": f"Self-call depth limit ({self.max_self_call_depth}) reached to prevent deep recursion"
+            }
         
         # Get the correct interface
-        interface = self.sub_llms[llm_type]
+        if is_self_call:
+            interface = self.main_interface
+        else:
+            if llm_type not in self.sub_llms:
+                logger.error(f"LLM type {llm_type.value} not found in sub_llms!")
+                return {"success": False, "error": f"Sub-LLM {llm_type.value} not available"}
+            interface = self.sub_llms[llm_type]
+        
         logger.info(f"Using interface: {type(interface).__name__} for {llm_type.value}")
         
         # Update UI based on type
         if isinstance(self.ui, MultiPaneUI):
-            self.ui.update_sub_pane(llm_type, query=prompt, status='processing')
+            if is_self_call:
+                self.ui.add_message("system", f"🔄 Self-querying {llm_type.value}...", "tool")
+            else:
+                self.ui.update_sub_pane(llm_type, query=prompt, status='processing')
         elif isinstance(self.ui, MultiWindowUI):
-            self.ui.add_line(llm_type, f"\n🔧 Receiving query from {self.main_llm.value}:")
-            self.ui.add_line(llm_type, f"Prompt: {prompt}")
-            self.ui.add_line(llm_type, "Processing...")
+            target = llm_type if not is_self_call else self.main_llm
+            self.ui.add_line(target, f"\n{'🔄 Self-query' if is_self_call else '🔧 Receiving query'} from {self.main_llm.value}:")
+            self.ui.add_line(target, f"Prompt: {prompt}")
+            self.ui.add_line(target, "Processing...")
         else:
-            self.ui.add_message("system", f"Querying {llm_type.value}...", "tool")
+            action = "Self-querying" if is_self_call else "Querying"
+            self.ui.add_message("system", f"{action} {llm_type.value}...", "tool")
         
         self.ui.refresh_display()
         
         # Build messages
         messages = []
+        
+        # For self-calls, add a special system message to prevent tool use
+        if is_self_call:
+            self.self_call_depth += 1
+            # Add anti-loop instruction
+            messages.append({
+                "role": "system",
+                "content": (
+                    "You are being called by yourself for a focused analysis. "
+                    "DO NOT use any tools in this response - provide a direct answer only. "
+                    "This prevents infinite loops. Focus on giving a clear, comprehensive response."
+                )
+            })
+        
         if include_context and len(self.conversation_history) > 0:
             # Include recent context
             context_messages = self.conversation_history[-10:]  # Last 10 messages
@@ -467,18 +565,31 @@ class MultiLLMBridge:
         messages.append({"role": "user", "content": prompt})
         
         # Make the API call
-        interface = self.sub_llms[llm_type]
         logger.info(f"About to call {llm_type.value} using interface {type(interface).__name__} with model {config.SELECTED_MODELS.get(llm_type, 'unknown')}")
-        result = interface.chat(
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens
-        )
+        
+        # For self-calls, explicitly disable tools
+        if is_self_call:
+            result = interface.chat(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=None  # No tools for self-calls
+            )
+        else:
+            result = interface.chat(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
+        
+        # Reset self-call depth if this was a self-call
+        if is_self_call:
+            self.self_call_depth -= 1
         
         # Log which model was actually used
         if result['success']:
             actual_model = result.get('model', 'unknown')
-            logger.info(f"Sub-LLM {llm_type.value} responded using model: {actual_model}")
+            logger.info(f"{'Self' if is_self_call else 'Sub'}-LLM {llm_type.value} responded using model: {actual_model}")
         
         # Process result
         if result['success']:
@@ -491,6 +602,9 @@ class MultiLLMBridge:
             # Update statistics
             self.stats[llm_type]['message_count'] += 1
             self.stats[llm_type]['tool_calls'] += 1
+            if is_self_call:
+                self.stats[llm_type]['self_calls'] += 1
+            
             if 'usage' in result:
                 self.stats[llm_type]['input_tokens'] += result['usage'].get('input_tokens', 0)
                 self.stats[llm_type]['output_tokens'] += result['usage'].get('output_tokens', 0)
@@ -505,28 +619,35 @@ class MultiLLMBridge:
             self.stats[llm_type]['total_cost'] += cost
             
             # Update UI
-            if isinstance(self.ui, MultiPaneUI):
-                self.ui.update_sub_pane(
-                    llm_type, 
-                    response=text_content, 
-                    status='complete',
-                    stats_update={
-                        'message_count': 1,
-                        'total_tokens': result['usage'].get('total_tokens', 0),
-                        'estimated_cost': cost
-                    }
-                )
-            elif isinstance(self.ui, MultiWindowUI):
-                self.ui.add_line(llm_type, f"\n✅ Response from {llm_type.value}:")
-                self.ui.add_line(llm_type, text_content)
-                self.ui.add_line(llm_type, f"\nTokens: {result['usage'].get('total_tokens', 0)}, Cost: ${cost:.4f}")
-                self.ui.update_stats(llm_type,
-                    message_count=1,
-                    total_tokens=result['usage'].get('total_tokens', 0),
-                    estimated_cost=cost
-                )
+            if is_self_call:
+                # For self-calls, update main window
+                if isinstance(self.ui, (MultiWindowUI, MultiPaneUI)):
+                    self.ui.add_message("system", f"🔄 Self-query completed", "tool")
+                    self.ui.add_message(llm_type.value, text_content, "assistant")
+            else:
+                # Regular sub-LLM update
+                if isinstance(self.ui, MultiPaneUI):
+                    self.ui.update_sub_pane(
+                        llm_type, 
+                        response=text_content, 
+                        status='complete',
+                        stats_update={
+                            'message_count': 1,
+                            'total_tokens': result['usage'].get('total_tokens', 0),
+                            'estimated_cost': cost
+                        }
+                    )
+                elif isinstance(self.ui, MultiWindowUI):
+                    self.ui.add_line(llm_type, f"\n✅ Response from {llm_type.value}:")
+                    self.ui.add_line(llm_type, text_content)
+                    self.ui.add_line(llm_type, f"\nTokens: {result['usage'].get('total_tokens', 0)}, Cost: ${cost:.4f}")
+                    self.ui.update_stats(llm_type,
+                        message_count=1,
+                        total_tokens=result['usage'].get('total_tokens', 0),
+                        estimated_cost=cost
+                    )
             
-            logger.info(f"{llm_type.value} response - Tokens: {result['usage'].get('total_tokens', 0)}, Cost: ${cost:.4f}")
+            logger.info(f"{llm_type.value} {'self-' if is_self_call else ''}response - Tokens: {result['usage'].get('total_tokens', 0)}, Cost: ${cost:.4f}")
             return {"success": True, "content": text_content}
             
         else:
@@ -534,7 +655,7 @@ class MultiLLMBridge:
             self.stats[llm_type]['errors'] += 1
             error_msg = result.get('error', 'Unknown error')
             
-            if isinstance(self.ui, MultiPaneUI):
+            if isinstance(self.ui, MultiPaneUI) and not is_self_call:
                 self.ui.update_sub_pane(llm_type, response=f"Error: {error_msg}", status='error')
             elif isinstance(self.ui, MultiWindowUI):
                 self.ui.add_line(llm_type, f"\n❌ Error: {error_msg}")
@@ -819,13 +940,23 @@ class MultiLLMBridge:
             )
     
     def _build_system_prompt(self) -> str:
-        """Build system prompt based on available sub-LLMs"""
-        if not self.sub_llms:
+        """Build system prompt based on available sub-LLMs (enhanced for self-calling)"""
+        if not self.sub_llms and not self.main_interface.supports_tools():
             return (f"You are {self.main_llm.value.upper()}, an AI assistant. "
                    f"Be helpful, accurate, and concise. Model: {config.SELECTED_MODELS.get(self.main_llm, 'unknown')}")
         
         # Get sub-LLM details
-        sub_llm_info = []
+        tool_info = []
+        
+        # Add self-calling info
+        model = config.SELECTED_MODELS.get(self.main_llm, 'unknown')
+        model_info = get_model_info(model)
+        tool_info.append(
+            f"- YOURSELF ({self.main_llm.value.upper()}, {model}): {model_info['description']} "
+            f"[USE FOR: fresh perspective, summarizing your thoughts, breaking down complex reasoning]"
+        )
+        
+        # Add sub-LLM info
         for llm_type, interface in self.sub_llms.items():
             model = config.SELECTED_MODELS.get(llm_type, 'unknown')
             model_info = get_model_info(model)
@@ -834,37 +965,47 @@ class MultiLLMBridge:
             info = f"- {llm_type.value.upper()} ({model}): {model_info['description']}"
             if supports_tools:
                 info += " [Supports tool calling]"
-            sub_llm_info.append(info)
+            tool_info.append(info)
         
-        tools_desc = "\n".join(sub_llm_info)
+        tools_desc = "\n".join(tool_info)
         
         return f"""You are {self.main_llm.value.upper()}, a sophisticated AI agent using model {config.SELECTED_MODELS.get(self.main_llm, 'unknown')}.
 
-You have access to other AI models as tools:
+You have access to other AI models as tools, INCLUDING YOURSELF:
 {tools_desc}
 
-You can query these models to:
-- Get different perspectives on complex topics
-- Verify information or cross-check answers
-- Delegate specialized tasks based on model strengths
-- Compare approaches to problem-solving
+Key capabilities:
+1. **Self-Querying**: You can call yourself with query_{self.main_llm.value} to:
+   - Get a fresh perspective on your own reasoning
+   - Summarize complex thoughts into clearer explanations
+   - Break down problems into sub-components
+   - Start a new line of reasoning without conversation baggage
+   - Note: Self-queries won't have tool access to prevent loops
+
+2. **Other Model Querying**: Call other models to:
+   - Get different perspectives on complex topics
+   - Verify information or cross-check answers
+   - Delegate specialized tasks based on model strengths
+   - Compare approaches to problem-solving
 
 Guidelines:
-1. Use sub-models when their capabilities would enhance your response
-2. Consider model costs when deciding which to use
-3. Synthesize information from multiple sources when appropriate
-4. Be transparent about when you're consulting other models
-5. Focus on providing the best possible answer to the user
+1. Use self-querying when you need to step back and reconsider
+2. Use sub-models when their capabilities would enhance your response
+3. Consider model costs when deciding which to use
+4. Synthesize information from multiple sources when appropriate
+5. Be transparent about when you're consulting yourself or other models
+6. Focus on providing the best possible answer to the user
 
 Current date: {datetime.now().strftime('%Y-%m-%d')}"""
     
     def get_statistics(self) -> Dict[str, Any]:
-        """Get comprehensive statistics"""
+        """Get comprehensive statistics (enhanced with self-call tracking)"""
         # Calculate totals
         total_tokens = 0
         total_cost = 0.0
         total_messages = 0
         total_tool_calls = 0
+        total_self_calls = 0
         total_errors = 0
         
         llm_stats = {}
@@ -873,6 +1014,7 @@ Current date: {datetime.now().strftime('%Y-%m-%d')}"""
             total_cost += stats['total_cost']
             total_messages += stats['message_count']
             total_tool_calls += stats['tool_calls']
+            total_self_calls += stats.get('self_calls', 0)
             total_errors += stats['errors']
             
             llm_stats[llm_type.value] = {
@@ -883,6 +1025,7 @@ Current date: {datetime.now().strftime('%Y-%m-%d')}"""
                 'output_tokens': stats['output_tokens'],
                 'total_cost': stats['total_cost'],
                 'tool_calls': stats['tool_calls'],
+                'self_calls': stats.get('self_calls', 0),
                 'errors': stats['errors'],
                 'avg_tokens_per_message': (stats['input_tokens'] + stats['output_tokens']) / max(1, stats['message_count'])
             }
@@ -895,6 +1038,7 @@ Current date: {datetime.now().strftime('%Y-%m-%d')}"""
             'total_cost': total_cost,
             'total_messages': total_messages,
             'total_tool_calls': total_tool_calls,
+            'total_self_calls': total_self_calls,
             'total_errors': total_errors,
             'session_duration_minutes': round(session_duration, 2),
             'conversation_length': len(self.conversation_history),
@@ -902,11 +1046,13 @@ Current date: {datetime.now().strftime('%Y-%m-%d')}"""
             'cost_per_message': round(total_cost / max(1, total_messages), 4),
             'llm_stats': llm_stats,
             'main_llm': self.main_llm.value,
-            'sub_llms': [llm.value for llm in self.sub_llms.keys()]
+            'sub_llms': [llm.value for llm in self.sub_llms.keys()],
+            'self_calling_enabled': True,
+            'max_self_call_depth': self.max_self_call_depth
         }
     
     def print_statistics(self):
-        """Print formatted statistics"""
+        """Print formatted statistics (enhanced with self-call info)"""
         stats = self.get_statistics()
         
         if isinstance(self.ui, (MultiWindowUI, MultiPaneUI)):
@@ -922,12 +1068,14 @@ Current date: {datetime.now().strftime('%Y-%m-%d')}"""
             print(f"Total tokens: {stats['total_tokens']:,}")
             print(f"Total cost: ${stats['total_cost']:.4f} (${stats['cost_per_message']:.4f}/msg)")
             print(f"Tool calls: {stats['total_tool_calls']}")
+            if stats['total_self_calls'] > 0:
+                print(f"Self-calls: {stats['total_self_calls']} 🔄")
             if stats['total_errors'] > 0:
                 print(f"{Colors.RED}Errors: {stats['total_errors']}{Colors.RESET}")
             
             print(f"\n{Colors.BOLD}{Colors.YELLOW}📈 Per-Model Breakdown:{Colors.RESET}")
             print("-" * 80)
-            print(f"{'Model':<40} {'Messages':<10} {'Tokens':<15} {'Cost':<10} {'Tools':<8}")
+            print(f"{'Model':<40} {'Messages':<10} {'Tokens':<15} {'Cost':<10} {'Tools':<8} {'Self':<6}")
             print("-" * 80)
             
             for llm_name, llm_stats in stats['llm_stats'].items():
@@ -939,17 +1087,24 @@ Current date: {datetime.now().strftime('%Y-%m-%d')}"""
                     is_main = llm_name == stats['main_llm']
                     prefix = "🎯 " if is_main else "   "
                     
+                    self_calls = llm_stats.get('self_calls', 0)
+                    self_call_str = str(self_calls) if self_calls > 0 else "-"
+                    
                     print(f"{prefix}{model_display:<38} "
                           f"{llm_stats['message_count']:<10} "
                           f"{llm_stats['total_tokens']:<15,} "
                           f"${llm_stats['total_cost']:<9.4f} "
-                          f"{llm_stats['tool_calls']:<8}")
+                          f"{llm_stats['tool_calls']:<8} "
+                          f"{self_call_str:<6}")
             
             print("=" * 80)
     
     def clear_conversation(self):
         """Clear conversation history and reset statistics"""
         self.conversation_history = []
+        # Reset self-call depth
+        self.self_call_depth = 0
+        
         for llm in self.stats:
             self.stats[llm] = {
                 'input_tokens': 0,
@@ -957,6 +1112,7 @@ Current date: {datetime.now().strftime('%Y-%m-%d')}"""
                 'message_count': 0,
                 'total_cost': 0.0,
                 'tool_calls': 0,
+                'self_calls': 0,  # Include self_calls in reset
                 'errors': 0
             }
         self.session_start = datetime.now()
@@ -1337,6 +1493,7 @@ def select_main_llm(available_keys: Dict[str, bool]) -> Optional[LLMType]:
     print(f"\n{Colors.BOLD}{Colors.YELLOW}🎯 Select Main LLM:{Colors.RESET}")
     print("=" * 60)
     print("The main LLM will handle your conversations and can call other LLMs as tools.")
+    print("NEW: The main LLM can also call itself for fresh perspectives! 🔄")
     print()
     
     options = []
@@ -1360,6 +1517,7 @@ def select_main_llm(available_keys: Dict[str, bool]) -> Optional[LLMType]:
             if 0 <= idx < len(options):
                 selected = options[idx]
                 print(f"✅ Selected {selected.value.upper()} as main LLM")
+                print(f"   {selected.value.upper()} will be able to call itself and other LLMs as tools")
                 return selected
         except ValueError:
             pass
@@ -1372,6 +1530,7 @@ def select_sub_llms(available_keys: Dict[str, bool], main_llm: LLMType) -> List[
     print("=" * 60)
     print("Select which LLMs the main AI can call as tools.")
     print("You can enable all, some, or none.")
+    print(f"Note: {main_llm.value.upper()} can always call itself regardless of this selection.")
     print()
     
     # Get available sub-LLMs (excluding main)
@@ -1383,10 +1542,11 @@ def select_sub_llms(available_keys: Dict[str, bool], main_llm: LLMType) -> List[
     
     if not options:
         print("⚠️  No other LLMs available as tools.")
+        print(f"   {main_llm.value.upper()} will only be able to call itself.")
         return []
     
     print(f"\n{len(options) + 1}. All available LLMs")
-    print(f"{len(options) + 2}. None (main LLM only)")
+    print(f"{len(options) + 2}. None (main LLM with self-calling only)")
     
     while True:
         try:
@@ -1398,7 +1558,7 @@ def select_sub_llms(available_keys: Dict[str, bool], main_llm: LLMType) -> List[
                 return options
             elif choice == str(len(options) + 2):
                 # None
-                print("✅ Main LLM will work standalone (no tools)")
+                print(f"✅ {main_llm.value.upper()} will work with self-calling only")
                 return []
             elif ',' in choice:
                 # Multiple selections
@@ -1767,6 +1927,7 @@ def interactive_chat_loop(bridge: MultiLLMBridge, ui: BaseTerminalUI):
 def main():
     """Main entry point"""
     print(f"\n{Colors.BOLD}{Colors.GREEN}🚀 Multi-LLM Bridge v{VERSION} ({VERSION_DATE}){Colors.RESET}")
+    print(f"{Colors.CYAN}Now with self-calling capability! 🔄{Colors.RESET}")
     print("=" * 80)
     
     # Check dependencies
@@ -1974,10 +2135,11 @@ def main():
     print(f"\n{Colors.BOLD}{Colors.GREEN}✅ Configuration Complete!{Colors.RESET}")
     print("=" * 80)
     print(f"Main LLM: {config.MAIN_LLM.value.upper()} ({config.SELECTED_MODELS[config.MAIN_LLM]})")
+    print(f"  🔄 Self-calling: Enabled (can query itself)")
     if config.ENABLED_SUB_LLMS:
         print(f"Sub-LLMs: {', '.join(f'{llm.value.upper()} ({config.SELECTED_MODELS[llm]})' for llm in config.ENABLED_SUB_LLMS)}")
     else:
-        print("Sub-LLMs: None (standalone mode)")
+        print("Sub-LLMs: None (self-calling only)")
     print(f"Display: {config.DISPLAY_MODE.replace('-', ' ').title()}")
     print(f"Log file: {current_log_file}")
     print("=" * 80)
