@@ -296,6 +296,9 @@ class MultiLLMBridge:
         
         # Build tools for main LLM
         self.tools = self._build_tools()
+        logger.info(f"Built {len(self.tools)} tools for main LLM")
+        for tool in self.tools:
+            logger.info(f"  Tool: {tool['name']}")
         
         # Session metadata
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -460,7 +463,9 @@ class MultiLLMBridge:
                 logger.error(f"LLMType {llm_type} not in sub_llms: {list(self.sub_llms.keys())}")
                 return {"success": False, "error": f"LLM {llm_name} not available as sub-LLM"}
             
-            return self._query_sub_llm(llm_type, tool_input)
+            result = self._query_sub_llm(llm_type, tool_input)
+            logger.info(f"Sub-LLM query result: success={result.get('success')}, has content={bool(result.get('content'))}")
+            return result
         
         # Handle info tools
         elif tool_name.startswith("get_") and tool_name.endswith("_info"):
@@ -510,11 +515,10 @@ class MultiLLMBridge:
             if not has_system and system_prompt:
                 messages.insert(0, {"role": "system", "content": system_prompt})
         
-        # FIX: Show thinking indicator in status line
+        # Show thinking indicator
         if hasattr(self.ui, 'set_status'):
             self.ui.set_status(f"{self.main_llm.value} thinking...")
         else:
-            # Fallback for UIs without status support
             if isinstance(self.ui, (MultiWindowUI, MultiPaneUI)):
                 self.ui.add_message(self.main_llm.value, f"[{self.main_llm.value} thinking...]", "thinking")
         
@@ -532,7 +536,6 @@ class MultiLLMBridge:
             try:
                 logger.info(f"Chat iteration {iteration} - Messages: {len(messages)}")
                 
-                # FIX: Update status for iteration
                 if hasattr(self.ui, 'set_status'):
                     self.ui.set_status(f"Processing message (iteration {iteration})...")
                 
@@ -540,13 +543,12 @@ class MultiLLMBridge:
                 result = self.main_interface.chat(
                     messages=messages,
                     system_prompt=system_prompt if self.main_llm == LLMType.CLAUDE else None,
-                    tools=self.tools if self.sub_llms and self.main_interface.supports_tools() else None
+                    tools=self.tools if self.main_interface.supports_tools() else None
                 )
                 
                 if not result['success']:
                     self.stats[self.main_llm]['errors'] += 1
                     error_msg = f"Error: {result['error']}"
-                    # FIX: Clear status on error
                     if hasattr(self.ui, 'clear_status'):
                         self.ui.clear_status()
                     self.ui.add_message(self.main_llm.value, error_msg, "error")
@@ -599,7 +601,6 @@ class MultiLLMBridge:
                 
                 # If no tool calls, we're done
                 if not has_tool_calls:
-                    # FIX: Clear status when done
                     if hasattr(self.ui, 'clear_status'):
                         self.ui.clear_status()
                     break
@@ -608,105 +609,103 @@ class MultiLLMBridge:
                 tool_use_count += len(result['tool_calls'])
                 self.stats[self.main_llm]['tool_calls'] += len(result['tool_calls'])
                 
-                # For Claude, we need to add the assistant message before processing tools
+                # CRITICAL FIX: For Claude, add the complete assistant message BEFORE processing tools
                 if self.main_llm == LLMType.CLAUDE and result.get('tool_calls'):
+                    # Add the complete assistant response including tool calls
+                    assistant_message = {
+                        "role": "assistant",
+                        "content": result['raw_response'].content
+                    }
+                    
                     if maintain_history:
-                        # Add the complete assistant response including tool calls
-                        self.conversation_history.append({
-                            "role": "assistant",
-                            "content": result['raw_response'].content
-                        })
-                        messages = self.conversation_history.copy()
-                    else:
-                        # Add to temporary messages
-                        messages.append({
-                            "role": "assistant",
-                            "content": result['raw_response'].content
-                        })
-                
-                for tool_call in result['tool_calls']:
-                    logger.info(f"Executing tool: {tool_call['name']}")
+                        self.conversation_history.append(assistant_message)
+                    messages.append(assistant_message)
                     
-                    # FIX: Show tool usage in status line
-                    if hasattr(self.ui, 'set_status'):
-                        self.ui.set_status(f"Executing tool: {tool_call['name']}")
-                    else:
-                        self.ui.add_message(
-                            self.main_llm.value,
-                            f"Using tool: {tool_call['name']}",
-                            "tool"
-                        )
-                    self.ui.refresh_display()
-                    
-                    # Execute tool
-                    tool_result = self.handle_tool_use(
-                        tool_call['name'],
-                        tool_call.get('input', {})
-                    )
-                    
-                    # Handle tool result based on LLM type
-                    if self.main_llm == LLMType.CLAUDE:
-                        # FIX: Update status for tool result processing
+                    # Now process each tool call and add results
+                    tool_results_added = []
+                    for tool_call in result['tool_calls']:
+                        logger.info(f"Executing tool: {tool_call['name']}")
+                        
                         if hasattr(self.ui, 'set_status'):
-                            self.ui.set_status("Processing tool result...")
+                            self.ui.set_status(f"Executing tool: {tool_call['name']}")
+                        else:
+                            self.ui.add_message(
+                                self.main_llm.value,
+                                f"Using tool: {tool_call['name']}",
+                                "tool"
+                            )
+                        self.ui.refresh_display()
                         
-                        # Claude needs the tool result message added to the conversation
-                        tool_result_message = {
-                            "role": "user",
-                            "content": [{
-                                "type": "tool_result",
-                                "tool_use_id": tool_call['id'],
-                                "content": json.dumps(tool_result) if not isinstance(tool_result.get('content', tool_result), str) else tool_result.get('content', str(tool_result))
-                            }]
-                        }
-                        
-                        # Add tool result to messages
-                        messages.append(tool_result_message)
-                        if maintain_history:
-                            self.conversation_history.append(tool_result_message)
-                        
-                        # Get Claude's response after tool use
-                        follow_up = self.main_interface.chat(
-                            messages=messages,
-                            system_prompt=system_prompt,
-                            tools=self.tools
-                        )
-                        
-                        if follow_up['success']:
-                            # Extract text from follow-up
-                            follow_up_text = ""
-                            for content_item in follow_up['content']:
-                                if isinstance(content_item, dict) and content_item.get('type') == 'text':
-                                    follow_up_text += content_item.get('text', '')
+                        # Execute tool
+                        try:
+                            tool_result = self.handle_tool_use(
+                                tool_call['name'],
+                                tool_call.get('input', {})
+                            )
                             
-                            if follow_up_text:
-                                final_response += "\n" + follow_up_text
+                            # Extract content from tool result
+                            tool_content = tool_result.get('content', '')
+                            if not tool_content and 'success' in tool_result:
+                                if tool_result.get('success'):
+                                    tool_content = json.dumps(tool_result)
+                                else:
+                                    tool_content = f"Error: {tool_result.get('error', 'Unknown error')}"
                             
-                            # Update stats for follow-up
-                            if 'usage' in follow_up:
-                                self._update_main_stats(follow_up['usage'])
+                            # Create tool result message
+                            tool_result_message = {
+                                "role": "user",
+                                "content": [{
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_call['id'],
+                                    "content": tool_content if isinstance(tool_content, str) else json.dumps(tool_content)
+                                }]
+                            }
                             
-                            # Update conversation history with the follow-up response
-                            if maintain_history and follow_up.get('content'):
-                                # Only add text responses to avoid duplicating tool calls
-                                has_text = any(c.get('type') == 'text' and c.get('text') 
-                                             for c in follow_up['content'])
-                                if has_text and 'raw_response' in follow_up:
-                                    self.conversation_history.append({
-                                        "role": "assistant", 
-                                        "content": follow_up['raw_response'].content
-                                    })
-                                    messages = self.conversation_history.copy()
+                            # Add to messages and history
+                            if maintain_history:
+                                self.conversation_history.append(tool_result_message)
+                            messages.append(tool_result_message)
+                            tool_results_added.append(tool_call['id'])
                             
-                            # Check if follow-up has more tool calls
-                            if not follow_up.get('tool_calls'):
-                                break
-                            else:
-                                result = follow_up  # Continue with new tool calls
+                        except Exception as e:
+                            logger.error(f"Error executing tool {tool_call['name']}: {str(e)}", exc_info=True)
+                            # Still add an error result to maintain proper message structure
+                            error_result_message = {
+                                "role": "user",
+                                "content": [{
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_call['id'],
+                                    "content": f"Tool execution error: {str(e)}"
+                                }]
+                            }
+                            if maintain_history:
+                                self.conversation_history.append(error_result_message)
+                            messages.append(error_result_message)
+                            tool_results_added.append(tool_call['id'])
                     
-                    elif self.main_llm == LLMType.OPENAI:
-                        # Add the assistant message with tool calls
-                        messages.append(result['raw_response'].choices[0].message.model_dump())
+                    # Verify all tool uses have results
+                    logger.info(f"Tool calls processed: {len(tool_results_added)} results added")
+                    
+                    # Continue loop to get Claude's next response
+                    continue
+                    
+                elif self.main_llm == LLMType.OPENAI:
+                    # Add the assistant message with tool calls
+                    messages.append(result['raw_response'].choices[0].message.model_dump())
+                    
+                    # Process tool calls
+                    for tool_call in result['tool_calls']:
+                        logger.info(f"Executing tool: {tool_call['name']}")
+                        
+                        if hasattr(self.ui, 'set_status'):
+                            self.ui.set_status(f"Executing tool: {tool_call['name']}")
+                        self.ui.refresh_display()
+                        
+                        # Execute tool
+                        tool_result = self.handle_tool_use(
+                            tool_call['name'],
+                            tool_call.get('input', {})
+                        )
                         
                         # Add tool result
                         formatted_result = self.main_interface.format_tool_response(
@@ -715,50 +714,43 @@ class MultiLLMBridge:
                         )
                         messages.append(formatted_result)
                     
-                    elif self.main_llm == LLMType.GEMINI:
-                        # Gemini handles tools differently
-                        messages.append({
-                            "role": "assistant",
-                            "content": text_content if text_content else "Processing tool results..."
-                        })
+                elif self.main_llm == LLMType.GEMINI:
+                    # Gemini handles tools differently
+                    messages.append({
+                        "role": "assistant",
+                        "content": text_content if text_content else "Processing tool results..."
+                    })
+                    
+                    for tool_call in result['tool_calls']:
+                        tool_result = self.handle_tool_use(
+                            tool_call['name'],
+                            tool_call.get('input', {})
+                        )
                         messages.append({
                             "role": "user",
                             "content": f"Tool {tool_call['name']} returned: {tool_result.get('content', str(tool_result))}"
                         })
-                
-                # For OpenAI/Gemini, continue the loop to get final response
-                if self.main_llm in [LLMType.OPENAI, LLMType.GEMINI] and has_tool_calls:
-                    continue
-                else:
-                    break
-                    
+                        
             except Exception as e:
                 logger.error(f"Error in chat loop: {str(e)}", exc_info=True)
                 self.stats[self.main_llm]['errors'] += 1
                 error_msg = f"Error: {str(e)}"
-                # FIX: Clear status on error
                 if hasattr(self.ui, 'clear_status'):
                     self.ui.clear_status()
                 self.ui.add_message(self.main_llm.value, error_msg, "error")
                 return error_msg
         
-        # FIX: Clear status when complete
+        # Clear status when complete
         if hasattr(self.ui, 'clear_status'):
             self.ui.clear_status()
         
         # Add final response to history if not already added
-        if maintain_history and final_response:
-            # For Claude with tool use, check if response was already added
-            last_message = self.conversation_history[-1] if self.conversation_history else None
-            
-            # Only add if the last message isn't already an assistant message with our content
-            if not (last_message and last_message.get('role') == 'assistant'):
-                self.conversation_history.append({
-                    "role": "assistant",
-                    "content": final_response
-                })
+        if maintain_history and final_response and not has_tool_calls:
+            self.conversation_history.append({
+                "role": "assistant",
+                "content": final_response
+            })
         
-        # Log summary
         logger.info(f"Chat complete - Iterations: {iteration}, Tool calls: {tool_use_count}, Response length: {len(final_response)}")
         
         # Auto-save if enabled
@@ -766,7 +758,7 @@ class MultiLLMBridge:
             self.auto_save()
         
         return final_response
-    
+        
     def _query_sub_llm(self, llm_type: LLMType, tool_input: Dict[str, Any]) -> Dict[str, Any]:
         """Query a sub-LLM and handle the response (enhanced for self-calling)"""
         prompt = tool_input.get('prompt', '')
@@ -810,14 +802,21 @@ class MultiLLMBridge:
             else:
                 self.ui.update_sub_pane(llm_type, query=prompt, status='processing')
         elif isinstance(self.ui, MultiWindowUI):
-            target = llm_type if not is_self_call else self.main_llm
-            # Don't add these as regular messages
-            if hasattr(self.ui, 'set_status'):
-                self.ui.set_status(f"{'Self-query' if is_self_call else 'Query'} to {llm_type.value}: {prompt[:50]}...")
+            # For self-calls in multi-window, add a clear visual separator
+            if is_self_call:
+                self.ui.add_line(self.main_llm, "")
+                self.ui.add_line(self.main_llm, f"{Colors.BRIGHT_YELLOW}{'='*60}{Colors.RESET}")
+                self.ui.add_line(self.main_llm, f"{Colors.BRIGHT_YELLOW}🔄 SELF-QUERY (Depth: {self.self_call_depth + 1}){Colors.RESET}")
+                self.ui.add_line(self.main_llm, f"{Colors.BRIGHT_YELLOW}{'='*60}{Colors.RESET}")
+                self.ui.add_line(self.main_llm, f"{Colors.YELLOW}Query: {prompt}{Colors.RESET}")
+                self.ui.add_line(self.main_llm, f"{Colors.DIM}Processing...{Colors.RESET}")
+                self.ui.refresh_display()
             else:
-                self.ui.add_line(target, f"\n{'🔄 Self-query' if is_self_call else '🔧 Receiving query'} from {self.main_llm.value}:")
-                self.ui.add_line(target, f"Prompt: {prompt}")
-                self.ui.add_line(target, "Processing...")
+                # Regular sub-LLM query - use add_line for MultiWindowUI
+                self.ui.add_line(llm_type, f"\n🔧 Receiving query from {self.main_llm.value}:")
+                self.ui.add_line(llm_type, f"Query: {prompt}")
+                self.ui.add_line(llm_type, "Processing...")
+                self.ui.refresh_display()
         else:
             action = "Self-querying" if is_self_call else "Querying"
             if hasattr(self.ui, 'set_status'):
@@ -910,9 +909,19 @@ class MultiLLMBridge:
             
             # Update UI
             if is_self_call:
-                # For self-calls, update main window
-                if isinstance(self.ui, (MultiWindowUI, MultiPaneUI)):
-                    # Don't add "Self-query completed" message, just the response
+                # For self-calls, update main window with clear visual distinction
+                if isinstance(self.ui, MultiWindowUI):
+                    self.ui.add_line(self.main_llm, "")
+                    self.ui.add_line(self.main_llm, f"{Colors.GREEN}✅ Self-Query Response:{Colors.RESET}")
+                    self.ui.add_line(self.main_llm, text_content)
+                    self.ui.add_line(self.main_llm, f"{Colors.DIM}Tokens: {result['usage'].get('total_tokens', 0)}, Cost: ${cost:.4f}{Colors.RESET}")
+                    self.ui.add_line(self.main_llm, f"{Colors.BRIGHT_YELLOW}{'='*60}{Colors.RESET}")
+                    self.ui.add_line(self.main_llm, "")
+                    self.ui.refresh_display()
+                elif isinstance(self.ui, MultiPaneUI):
+                    self.ui.add_message(llm_type.value, text_content, "assistant")
+                else:
+                    # Standard UI
                     self.ui.add_message(llm_type.value, text_content, "assistant")
             else:
                 # Regular sub-LLM update
@@ -936,6 +945,10 @@ class MultiLLMBridge:
                         total_tokens=result['usage'].get('total_tokens', 0),
                         estimated_cost=cost
                     )
+                    self.ui.refresh_display()
+                else:
+                    # Standard UI
+                    self.ui.add_message(llm_type.value, text_content, "assistant")
             
             logger.info(f"{llm_type.value} {'self-' if is_self_call else ''}response - Tokens: {result['usage'].get('total_tokens', 0)}, Cost: ${cost:.4f}")
             return {"success": True, "content": text_content}
@@ -949,10 +962,19 @@ class MultiLLMBridge:
             if hasattr(self.ui, 'clear_status'):
                 self.ui.clear_status()
             
-            if isinstance(self.ui, MultiPaneUI) and not is_self_call:
+            # Update UI with error
+            if is_self_call and isinstance(self.ui, MultiWindowUI):
+                self.ui.add_line(self.main_llm, f"{Colors.RED}❌ Self-Query Error: {error_msg}{Colors.RESET}")
+                self.ui.add_line(self.main_llm, f"{Colors.BRIGHT_YELLOW}{'='*60}{Colors.RESET}")
+                self.ui.refresh_display()
+            elif isinstance(self.ui, MultiPaneUI) and not is_self_call:
                 self.ui.update_sub_pane(llm_type, response=f"Error: {error_msg}", status='error')
-            elif isinstance(self.ui, MultiWindowUI):
+            elif isinstance(self.ui, MultiWindowUI) and not is_self_call:
                 self.ui.add_line(llm_type, f"\n❌ Error: {error_msg}")
+                self.ui.refresh_display()
+            else:
+                # Standard UI
+                self.ui.add_message(llm_type.value, f"Error: {error_msg}", "error")
             
             logger.error(f"{llm_type.value} error: {error_msg}")
             return result
@@ -988,7 +1010,7 @@ class MultiLLMBridge:
     
     def _build_system_prompt(self) -> str:
         """Build system prompt based on available sub-LLMs (enhanced for self-calling)"""
-        if not self.sub_llms and not self.main_interface.supports_tools():
+        if not self.main_interface.supports_tools():
             return (f"You are {self.main_llm.value.upper()}, an AI assistant. "
                    f"Be helpful, accurate, and concise. Model: {config.SELECTED_MODELS.get(self.main_llm, 'unknown')}")
         
@@ -1042,6 +1064,7 @@ Guidelines:
 4. Synthesize information from multiple sources when appropriate
 5. Be transparent about when you're consulting yourself or other models
 6. Focus on providing the best possible answer to the user
+7. Don't hesitate to use your tools - they're here to help you provide better answers
 
 Current date: {datetime.now().strftime('%Y-%m-%d')}"""
     
