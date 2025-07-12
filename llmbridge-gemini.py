@@ -1,24 +1,42 @@
 #!/usr/bin/env python3
 """
-Multi-LLM Agent Bridge - Multi-Pane Version
-Version: 5.3.0 (2025-07-11)
+Multi-LLM Agent Bridge - Curses UI Version
+Version: 6.2.9 (2025-07-12)
 
 An AI agent that can use other LLMs (including itself) as tools, displaying
-all interactions in a dynamic, multi-window terminal interface.
+all interactions in a dynamic, multi-window terminal interface with full
+keyboard control for scrolling and window selection.
 
 Changelog:
-- v5.3.0: Corrected tool execution logic to prevent passing invalid tool schemas
-          to sub-agents, fixing the Anthropic API error.
-- v5.2.x: Bug fixes for API key loading, client initialization, and response parsing.
-- v5.1.x: Bug fixes for API key loading and client initialization.
-- v5.0.0: Refactored core provider logic to use Enum.
-- v4.x: Added multi-pane UI, self-calling tools, config management, and bug fixes.
+- v6.2.9: Fixed 'AttributeError: MultiLLMAgentBridge object has no attribute _initialize_stats'
+          by restoring the missing `_initialize_stats` method within the `MultiLLMAgentBridge` class.
+- v6.2.8: Fixed IndentationError after 'except' statement by adding 'pass'.
+- v6.2.7: Fixed 'AttributeError: MultiLLMAgentBridge object has no attribute stdscr'
+          by correctly placing `stdscr.nodelay(True)` within `CursesUI.__init__`.
+          Ensured `nodelay` state is managed consistently.
+- v6.2.6: Further refined Curses UI input handling to eliminate flashing and
+          typing issues. Implemented non-blocking input, explicit window refreshes,
+          and more robust redraw logic, particularly for the input line.
+- v6.2.5: Fixed input prompt flashing and typing issues by optimizing UI redraws.
+          Input line is now redrawn only when necessary, improving responsiveness.
+          Added specific input line window for better control.
+- v6.2.4: Improved Curses UI rendering for scrollback, window geometry adaptation,
+          and correct newline/carriage return handling in all panes.
+          Increased default scrollback for sub-panes and added better column
+          width calculation.
+- v6.2.3: Corrected KeyError on startup when loading a saved configuration by
+          ensuring consistent use of string keys for model selections.
+- v6.2.2: Corrected ImportError for Gemini's 'Candidate' type.
+- v6.2.1: Fixed NameError for 'Union' by adding the correct import.
+- v6.2.0: Corrected narrow column formatting in sub-agent panes.
+- v6.1.x: Bug fixes for CursesUI implementation and error handling.
+- v6.0.0: Re-architected with the `curses` library for a full TUI experience.
 """
 import os
 import sys
 import json
 import textwrap
-from typing import Dict, List, Optional, Any, Tuple, Literal, Type
+from typing import Dict, List, Optional, Any, Tuple, Literal, Type, Union
 from enum import Enum
 from abc import ABC, abstractmethod
 from anthropic import Anthropic
@@ -31,6 +49,7 @@ import time
 import shutil
 import platform
 import signal
+import curses
 
 # --- Type Imports for Explicit Checking ---
 from anthropic.types import Message as AnthropicMessage
@@ -38,7 +57,7 @@ from openai.types.chat.chat_completion_message import ChatCompletionMessage as O
 from google.ai.generativelanguage import Candidate as GeminiCandidate
 
 # --- CONFIGURATION ---
-VERSION = "5.3.0"
+VERSION = "6.2.9" # Updated version
 CONFIG_FILE_NAME = ".llm_bridge_config.json"
 
 class Provider(Enum):
@@ -63,6 +82,8 @@ PRICE_MAPPING = {
 
 class Config:
     SHOW_SUB_AGENT_PANES = True
+    MAX_MAIN_SCROLLBACK_LINES = 1000 # Max lines for the main conversation pane
+    MAX_SUB_SCROLLBACK_LINES = 500   # Max lines for sub-agent panes
 
 config = Config()
 
@@ -122,7 +143,7 @@ def setup_env_file():
     print("✅ .env file created.")
     if not Path(".gitignore").exists():
         with open(".gitignore", "w") as f: f.write(".env\n.logs/\n")
-        print("✅ Created .gitignore to protect secrets.")
+    print("✅ Created .gitignore to protect secrets.")
     return True
 
 # --- LLM INTERFACE ABSTRACTION ---
@@ -201,84 +222,216 @@ class GeminiInterface(LLMInterface):
             return {"success": True, "response_obj": r.candidates[0], "usage": {"input_tokens": i_tok, "output_tokens": o_tok}, "cost": cost}
         except Exception as e: return {"success": False, "error": str(e)}
 
-class TerminalUI:
-    def __init__(self, active_providers: List[Provider]):
-        self.last_terminal_size = (0, 0)
+class CursesUI:
+    def __init__(self, stdscr, active_providers: List[Provider], primary_agent: Provider):
+        self.stdscr = stdscr 
         self.active_providers = active_providers
-        self.provider_pane_content: Dict[Provider, List[str]] = {p: ["No activity yet."] for p in active_providers}
-        self.install_resize_handler()
+        self.primary_agent = primary_agent
+        
+        self.panes = {p: {'lines': ["No activity yet."], 'scroll_offset': 0} for p in self.active_providers}
+        self.panes['main'] = {'lines': [], 'scroll_offset': 0}
+        
+        self.window_order: List[Union[Provider, Literal['main']]] = self.active_providers + ['main']
+        self.active_window_idx = len(self.window_order) - 1 
 
-    def install_resize_handler(self):
-        if hasattr(signal, 'SIGWINCH'): signal.signal(signal.SIGWINCH, self._handle_resize)
+        curses.curs_set(1) 
+        curses.start_color()
+        curses.init_pair(1, curses.COLOR_YELLOW, curses.COLOR_BLACK) 
+        curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_BLACK)  
+        curses.init_pair(3, curses.COLOR_GREEN, curses.COLOR_BLACK)  
 
-    def _handle_resize(self, signum, frame): self.last_terminal_size = (0, 0)
+        self.last_terminal_size = (0, 0)
+        
+        self.input_win = None
+        
+        self.stdscr.nodelay(True) 
+            
+    def get_active_window_key(self) -> Union[Provider, Literal['main']]:
+        return self.window_order[self.active_window_idx]
 
-    def get_terminal_size(self) -> Tuple[int, int]:
-        try: return shutil.get_terminal_size()
-        except OSError: return (120, 40)
+    def cycle_active_window(self):
+        self.active_window_idx = (self.active_window_idx + 1) % len(self.window_order)
+        self.panes[self.get_active_window_key()]['scroll_offset'] = 0
 
-    def clear_screen(self): os.system('cls' if os.name == 'nt' else 'clear')
-    def move_cursor(self, row, col): print(f"\033[{row};{col}H", end='')
+    def scroll_active_window(self, direction: int, amount: int):
+        key = self.get_active_window_key()
+        pane = self.panes[key]
+        
+        if direction == -1: 
+            pane['scroll_offset'] = min(pane['scroll_offset'] + amount, len(pane['lines']) -1)
+        elif direction == 1: 
+            pane['scroll_offset'] = max(0, pane['scroll_offset'] - amount)
+        elif direction == 0: 
+            pane['scroll_offset'] = 0 
+        elif direction == 2: 
+            pane['scroll_offset'] = len(pane['lines']) -1 
+            
+    def _add_lines_to_pane(self, pane_key: Union[Provider, Literal['main']], message: str, max_lines: int):
+        lines_to_add = []
+        term_height, term_width = self.stdscr.getmaxyx()
+        
+        if pane_key == 'main':
+            pane_width = term_width - 4 
+        else:
+            num_sub_panes = len(self.active_providers)
+            pane_width = max(1, term_width // num_sub_panes) - 4 
+        
+        drawable_width_for_wrap = max(1, pane_width) 
+
+        for line in message.split('\n'):
+            wrapped = textwrap.wrap(line, width=drawable_width_for_wrap, subsequent_indent="  ")
+            lines_to_add.extend(wrapped)
+        
+        self.panes[pane_key]['lines'].extend(lines_to_add)
+        
+        current_lines = self.panes[pane_key]['lines']
+        if len(current_lines) > max_lines:
+            self.panes[pane_key]['lines'] = current_lines[-max_lines:]
+        
+        self.panes[pane_key]['scroll_offset'] = 0
+            
+    def add_line_to_main_log(self, message: str):
+        self._add_lines_to_pane('main', message, config.MAX_MAIN_SCROLLBACK_LINES)
 
     def update_provider_pane(self, provider: Provider, query: str, response: str):
-        pane_width = self.get_terminal_size()[0] // len(self.active_providers) - 4
-        q_wrapped = textwrap.wrap(f"Q: {query}", width=pane_width)
-        r_wrapped = textwrap.wrap(f"A: {response}", width=pane_width)
-        self.provider_pane_content[provider] = q_wrapped + ["-" * pane_width] + r_wrapped
+        self.panes[provider]['lines'] = [] 
+        self._add_lines_to_pane(provider, f"Q: {query}", config.MAX_SUB_SCROLLBACK_LINES)
+        self._add_lines_to_pane(provider, "---", config.MAX_SUB_SCROLLBACK_LINES)
+        self._add_lines_to_pane(provider, f"A: {response}", config.MAX_SUB_SCROLLBACK_LINES)
+        
+        self.panes[provider]['scroll_offset'] = 0
 
-    def draw_layout(self, stats: Dict[str, Any], conversation_log: List[str]):
-        term_width, term_height = self.get_terminal_size()
-        if (term_width, term_height) != self.last_terminal_size:
-            self.clear_screen()
-            self.last_terminal_size = (term_width, term_height)
+    def draw(self, stats):
+        term_height, term_width = self.stdscr.getmaxyx()
 
-        if config.SHOW_SUB_AGENT_PANES and len(self.active_providers) > 1:
-            self._draw_multi_pane_layout(term_width, term_height, stats, conversation_log)
+        if (term_height, term_width) != self.last_terminal_size:
+            self.stdscr.clear() 
+            self.last_terminal_size = (term_height, term_width)
+            curses.resizeterm(term_height, term_width) 
+            self.input_win = None 
+
+        if config.SHOW_SUB_AGENT_PANES and len(self.active_providers) > 0:
+            self._draw_multi_pane_layout(term_width, term_height, stats)
         else:
-            self._draw_focused_layout(term_width, term_height, conversation_log)
+            self._draw_focused_layout(term_width, term_height)
+        
+        self.stdscr.noutrefresh()
 
-        self.move_cursor(term_height, 1)
-        print(f"{Colors.BOLD}{Colors.GREEN}You: {Colors.RESET}", end='')
-        sys.stdout.flush()
+    def _draw_multi_pane_layout(self, term_width, term_height, stats):
+        sub_pane_target_height = 14 
+        min_main_area_height = 5 
+        
+        available_sub_pane_height = term_height - min_main_area_height
+        
+        pane_height = min(sub_pane_target_height, max(5, available_sub_pane_height // 2))
 
-    def _draw_multi_pane_layout(self, term_width, term_height, stats, conversation_log):
-        pane_height = 14
-        pane_width = term_width // len(self.active_providers)
+        num_sub_panes = len(self.active_providers)
+        pane_width = max(1, term_width // num_sub_panes)
+        
+        last_pane_width = pane_width + (term_width - (pane_width * num_sub_panes))
+
         for i, provider in enumerate(self.active_providers):
-            col_start = i * pane_width + 1
+            is_active = self.get_active_window_key() == provider
+            current_pane_width = last_pane_width if i == num_sub_panes - 1 else pane_width
+            
+            current_pane_width = max(1, min(current_pane_width, term_width - (i * pane_width)))
+            
+            win = self.stdscr.subwin(max(1, pane_height), current_pane_width, 0, i * pane_width)
+            win.erase() 
+
+            win.attron(curses.color_pair(1) if is_active else curses.color_pair(2))
+            win.border()
+            win.attroff(curses.color_pair(1) if is_active else curses.color_pair(2))
+            
             title = f" {provider.value.upper()} "
-            if stats.get('primary_agent') == provider.value: title += "(AGENT) "
-            self.move_cursor(1, col_start); print(f"{Colors.BRIGHT_BLACK}┌" + title.center(pane_width - 2, "─") + f"┐{Colors.RESET}")
-            for r in range(2, pane_height):
-                self.move_cursor(r, col_start); print(f"{Colors.BRIGHT_BLACK}│{' ' * (pane_width - 2)}│{Colors.RESET}")
-            self.move_cursor(pane_height, col_start); print(f"{Colors.BRIGHT_BLACK}└" + "─" * (pane_width - 2) + f"┘{Colors.RESET}")
-            content = self.provider_pane_content[provider]
-            for r, line in enumerate(content[:pane_height-2]):
-                self.move_cursor(r + 2, col_start + 2); print(line[:pane_width-4])
+            if provider == self.primary_agent: title += "(AGENT) "
+            
+            try:
+                win.addstr(0, 2, title[:current_pane_width-4], curses.A_BOLD if is_active else curses.A_NORMAL)
+            except curses.error:
+                pass 
 
-        main_pane_row_start = pane_height + 1
-        self._draw_main_conversation_pane(term_width, term_height, main_pane_row_start, conversation_log)
+            self._draw_pane_content(win, self.panes[provider], pane_height, current_pane_width)
+            win.noutrefresh() 
 
-    def _draw_focused_layout(self, term_width, term_height, conversation_log):
-        self._draw_main_conversation_pane(term_width, term_height, 1, conversation_log)
+        main_pane_start_row = pane_height
+        main_pane_height = term_height - main_pane_start_row - 1 
+        self._draw_main_conversation_pane(term_width, term_height, main_pane_start_row, main_pane_height)
 
-    def _draw_main_conversation_pane(self, term_width, term_height, start_row, conversation_log):
-        self.move_cursor(start_row, 1)
-        title = " MAIN CONVERSATION "
-        print(f"{Colors.BRIGHT_BLACK}┌" + title.center(term_width - 2, "─") + f"┐{Colors.RESET}")
+    def _draw_focused_layout(self, term_width, term_height):
+        main_pane_height = term_height - 1 
+        self._draw_main_conversation_pane(term_width, term_height, 0, main_pane_height)
+
+    def _draw_main_conversation_pane(self, term_width, term_height, start_row, main_pane_height):
+        is_main_active = self.get_active_window_key() == 'main'
         
-        conversation_height = term_height - start_row - 2
-        for r in range(conversation_height + 1):
-            self.move_cursor(start_row + r + 1, 1)
-            print(f"{Colors.BRIGHT_BLACK}│{' ' * (term_width - 2)}│{Colors.RESET}")
+        main_pane_height = max(1, main_pane_height)
         
-        self.move_cursor(term_height -1, 1)
-        print(f"{Colors.BRIGHT_BLACK}└" + "─" * (term_width - 2) + f"┘{Colors.RESET}")
+        win = self.stdscr.subwin(main_pane_height, term_width, start_row, 0)
+        win.erase() 
+
+        win.attron(curses.color_pair(1) if is_main_active else curses.color_pair(2))
+        win.border()
+        win.attroff(curses.color_pair(1) if is_main_active else curses.color_pair(2))
         
-        if conversation_height > 0:
-            display_lines = conversation_log[-conversation_height:]
-            for r, line in enumerate(display_lines):
-                self.move_cursor(start_row + r + 1, 3); print(line)
+        try:
+            win.addstr(0, 2, " MAIN CONVERSATION ", curses.A_BOLD if is_main_active else curses.A_NORMAL)
+        except curses.error:
+            pass 
+
+        self._draw_pane_content(win, self.panes['main'], main_pane_height, term_width)
+        win.noutrefresh() 
+
+    def _draw_pane_content(self, win, pane_data, win_height, win_width):
+        content_h = win_height - 2 
+        drawable_width = win_width - 4 
+
+        if content_h <= 0 or drawable_width <= 0:
+            return 
+
+        lines = pane_data['lines']
+        scroll_offset = pane_data['scroll_offset']
+
+        display_start_idx = max(0, len(lines) - content_h - scroll_offset)
+        display_end_idx = min(len(lines), display_start_idx + content_h)
+
+        for r, line_idx in enumerate(range(display_start_idx, display_end_idx)):
+            line = lines[line_idx]
+            display_line = line[:drawable_width]
+            
+            try:
+                if pane_data == self.panes['main'] and display_line.startswith("You:"):
+                    win.addstr(r + 1, 2, "You:", curses.color_pair(3) | curses.A_BOLD)
+                    win.addstr(display_line[4:])
+                else:
+                    win.addstr(r + 1, 2, display_line)
+            except curses.error:
+                pass
+
+    def _draw_input_line(self, input_buffer: str):
+        h, w = self.stdscr.getmaxyx()
+        
+        if self.input_win is None or self.input_win.getmaxyx() != (1, w) or self.input_win.getbegyx() != (h - 1, 0):
+            try:
+                if self.input_win is not None:
+                    del self.input_win
+            except AttributeError:
+                pass
+            self.input_win = self.stdscr.subwin(1, w, h - 1, 0)
+            self.input_win.keypad(True) 
+
+        self.input_win.erase() 
+        
+        prompt = "> "
+        self.input_win.addstr(0, 0, prompt) 
+        
+        max_input_width = w - len(prompt) - 1 
+        display_input = input_buffer[:max_input_width]
+        self.input_win.addstr(0, len(prompt), display_input)
+        
+        self.input_win.move(0, len(prompt) + len(display_input))
+        
+        self.input_win.noutrefresh() 
 
 class MultiLLMAgentBridge:
     def __init__(self, api_keys: Dict[str, str], primary_agent: Provider, model_selections: Dict[str, str]):
@@ -293,11 +446,10 @@ class MultiLLMAgentBridge:
                 self.interfaces[p] = globals()[class_name](api_keys[p.value], model_selections[p.value])
         
         self.primary_interface = self.interfaces[primary_agent]
-        self.ui = TerminalUI(list(self.interfaces.keys()))
-        self.conversation_log = []
-        self.stats = self._initialize_stats()
-    
-    def _initialize_stats(self) -> Dict:
+        self.stats = self._initialize_stats() # This line caused the error!
+        self.ui: Optional[CursesUI] = None 
+
+    def _initialize_stats(self) -> Dict: # THIS METHOD IS NOW HERE!
         stats = {p.value: {"input_tokens": 0, "output_tokens": 0, "cost": 0.0, "model": self.model_selections[p.value]} for p in self.interfaces.keys()}
         stats["session_start"] = datetime.now()
         stats["primary_agent"] = self.primary_agent_name.value
@@ -312,7 +464,7 @@ class MultiLLMAgentBridge:
             if self.primary_agent_name == Provider.ANTHROPIC:
                 tools.append({"name": tool_name, "description": desc, "input_schema": {"type": "object", "properties": props, "required": ["prompt"]}})
             else:
-                 tools.append({"name": tool_name, "description": desc, "parameters": {"type": "object", "properties": props, "required": ["prompt"]}})
+                tools.append({"name": tool_name, "description": desc, "parameters": {"type": "object", "properties": props, "required": ["prompt"]}})
         return tools
 
     def _update_stats(self, provider: Provider, usage: Dict, cost: float):
@@ -325,13 +477,17 @@ class MultiLLMAgentBridge:
         client = self.interfaces[target_provider]
         prompt = tool_input.get("prompt", "")
         self.ui.update_provider_pane(target_provider, prompt, "[Waiting for response...]")
-        self.ui.draw_layout(self.stats, self.conversation_log)
         
-        # ** FIX: Sub-agents should never be given tools. **
-        system_prompt_for_tool = "You are a helpful assistant. Please answer the user's prompt directly and concisely. Do not use any tools."
+        self.ui.draw(self.stats) 
+        self.ui._draw_input_line("") 
+        curses.doupdate()
+
+        self.ui.stdscr.nodelay(False) 
+
+        response = client.chat(messages=[{"role": "user", "content": prompt}], system_prompt="You are a helpful assistant. Please answer the user's prompt directly and concisely. Do not use any tools.", tools=[])
         
-        response = client.chat(messages=[{"role": "user", "content": prompt}], system_prompt=system_prompt_for_tool, tools=[])
-        
+        self.ui.stdscr.nodelay(True) 
+
         if response["success"]:
             self._update_stats(target_provider, response['usage'], response['cost'])
             text_content = self._extract_text_from_response(response['response_obj'])
@@ -352,7 +508,11 @@ class MultiLLMAgentBridge:
         return ""
 
     def chat(self, user_prompt: str):
-        self.log_to_display(f"{Colors.BOLD}{Colors.GREEN}You: {Colors.RESET} {user_prompt}")
+        self.ui.add_line_to_main_log(f"You: {user_prompt}")
+        
+        self.ui.draw(self.stats) 
+        curses.doupdate() 
+        
         self.conversation_history.append({"role": "user", "content": user_prompt})
         
         other_tools = [f"`query_{p.value}`" for p in self.interfaces if p != self.primary_agent_name]
@@ -365,11 +525,27 @@ class MultiLLMAgentBridge:
         current_messages = self.conversation_history.copy()
         
         while True: 
-            self.log_to_display(f"{Colors.BOLD}{Colors.CYAN}🤖 {self.primary_agent_name.value.capitalize()}: {Colors.RESET}{Colors.BRIGHT_BLACK}[thinking...]{Colors.RESET}")
-            self.ui.draw_layout(self.stats, self.conversation_log)
+            thinking_line = f"🤖 {self.primary_agent_name.value.capitalize()}: [thinking...]"
+            self.ui.add_line_to_main_log(thinking_line) 
+            self.ui.draw(self.stats) 
+            curses.doupdate() 
+            
+            self.ui.stdscr.nodelay(False) 
             response = self.primary_interface.chat(messages=current_messages, system_prompt=system_prompt, tools=self._generate_tools_schema())
+            self.ui.stdscr.nodelay(True) 
 
-            if not response["success"]: self.log_to_display(f"ERROR: {response['error']}", error=True); break
+            try:
+                if self.ui.panes['main']['lines'] and self.ui.panes['main']['lines'][-1] == thinking_line:
+                    self.ui.panes['main']['lines'].pop() 
+            except IndexError:
+                pass 
+
+            if not response["success"]:
+                self.ui.add_line_to_main_log(f"ERROR: {response['error']}")
+                self.ui.draw(self.stats) 
+                curses.doupdate()
+                break
+            
             self._update_stats(self.primary_agent_name, response['usage'], response['cost'])
             
             response_obj = response['response_obj']
@@ -384,20 +560,33 @@ class MultiLLMAgentBridge:
                 if response_obj.tool_calls:
                     for tc in response_obj.tool_calls: tool_calls.append({'id': tc.id, 'name': tc.function.name, 'input': json.loads(tc.function.arguments)})
             elif isinstance(response_obj, GeminiCandidate):
-                 if hasattr(response_obj, 'content') and hasattr(response_obj.content, 'parts'):
+                if hasattr(response_obj, 'content') and hasattr(response_obj.content, 'parts'):
                     for part in response_obj.content.parts:
                         if part.function_call: tool_calls.append({'id': part.function_call.name, 'name': part.function_call.name, 'input': dict(part.function_call.args)})
 
-            if interim_text: self.log_to_display(f"{Colors.BOLD}{Colors.CYAN}🤖 {self.primary_agent_name.value.capitalize()}: {Colors.RESET}{interim_text}")
+            if interim_text:
+                self.ui.add_line_to_main_log(f"🤖 {self.primary_agent_name.value.capitalize()}: {interim_text}")
+                self.ui.draw(self.stats) 
+                curses.doupdate()
 
-            if not tool_calls: break
+            if not tool_calls:
+                break 
 
             self.conversation_history.append({"role": "assistant", "content": response_obj.model_dump_json() if hasattr(response_obj, 'model_dump_json') else str(response_obj)})
             
             tool_results = []
             for tool_call in tool_calls:
+                self.ui.add_line_to_main_log(f"⚙️ Calling Tool: {tool_call['name']}({json.dumps(tool_call['input'])})")
+                self.ui.draw(self.stats) 
+                curses.doupdate()
+                
                 result = self._execute_tool_call(tool_call['name'], tool_call['input'])
                 tool_result_content = result['content'] if result['success'] else f"Error: {result['error']}"
+                
+                self.ui.add_line_to_main_log(f"✅ Tool Result: {tool_result_content}")
+                self.ui.draw(self.stats) 
+                curses.doupdate()
+
                 if self.primary_agent_name == Provider.ANTHROPIC: tool_results.append({"type": "tool_result", "tool_use_id": tool_call['id'], "content": tool_result_content})
                 else: tool_results.append({"role": "tool", "tool_call_id": tool_call['id'], "name": tool_call['name'], "content": tool_result_content})
             
@@ -405,54 +594,88 @@ class MultiLLMAgentBridge:
             if self.primary_agent_name == Provider.ANTHROPIC: current_messages.append({"role": "user", "content": tool_results})
             else: current_messages.extend(tool_results)
 
-    def log_to_display(self, message: str, error: bool = False):
-        term_width, term_height = self.ui.get_terminal_size()
-        main_pane_width = term_width - 4
-        prefix = f"{Colors.BOLD}{Colors.RED}ERROR: {Colors.RESET}" if error else ""
+    def run_curses(self, stdscr_main_arg): 
+        self.ui = CursesUI(stdscr_main_arg, list(self.interfaces.keys()), self.primary_agent_name)
+        input_buffer = ""
         
-        all_wrapped_lines = []
-        for line in message.split('\n'):
-            wrapped_lines = textwrap.wrap(prefix + line, width=main_pane_width, subsequent_indent="  " if not prefix else "    ")
-            all_wrapped_lines.extend(wrapped_lines or [""])
-            prefix = ""
+        self.ui.draw(self.stats) 
+        self.ui._draw_input_line(input_buffer) 
+        curses.doupdate() 
 
-        if self.conversation_log and "[thinking...]" in self.conversation_log[-1]: self.conversation_log.pop()
-        self.conversation_log.extend(all_wrapped_lines)
-        
-        max_log_lines = term_height * 2
-        if len(self.conversation_log) > max_log_lines: self.conversation_log = self.conversation_log[-max_log_lines:]
-
-    def run(self):
-        self.ui.clear_screen()
         while True:
-            self.ui.draw_layout(self.stats, self.conversation_log)
-            try:
-                user_input = input().strip()
-                if not user_input: continue
-                
-                command = user_input.lower()
-                if command in ['exit', 'quit', 'q']: self.ui.clear_screen(); break
-                elif command == 'clear': self.conversation_log = []; self.conversation_history = []
-                elif command == 'toggle-panes': config.SHOW_SUB_AGENT_PANES = not config.SHOW_SUB_AGENT_PANES
-                elif command == 'stats': self.print_stats_summary()
-                elif command == 'help': self.print_help()
-                else: self.chat(user_input)
-            except (KeyboardInterrupt, EOFError): self.ui.clear_screen(); break
-    
-    def print_stats_summary(self):
-        self.log_to_display(f"{Colors.BOLD}{Colors.YELLOW}--- Session Statistics ---{Colors.RESET}")
-        for p_value, s in self.stats.items():
-            if p_value in ["session_start", "primary_agent"]: continue
-            cost_str = f"${s['cost']:.5f}"
-            if s['cost'] == 0 and s['input_tokens'] > 0: cost_str += " (Price Unknown)"
-            self.log_to_display(f"{Colors.YELLOW}{p_value.capitalize()}:{Colors.RESET} Model: {s['model']}, Tokens: {s['input_tokens'] + s['output_tokens']:,}, Cost: {cost_str}")
+            h, w = self.ui.stdscr.getmaxyx() 
+            if (h, w) != self.ui.last_terminal_size:
+                self.ui.last_terminal_size = (0,0) 
+                self.ui.draw(self.stats) 
+                self.ui._draw_input_line(input_buffer) 
+                curses.doupdate()
+                continue 
 
-    def print_help(self):
-        self.log_to_display(f"{Colors.BOLD}{Colors.YELLOW}--- Help ---{Colors.RESET}")
-        self.log_to_display(f"{Colors.YELLOW}toggle-panes:{Colors.RESET} Show/hide the top sub-agent panes.")
-        self.log_to_display(f"{Colors.YELLOW}stats:{Colors.RESET}         Print a detailed summary of token usage and costs.")
-        self.log_to_display(f"{Colors.YELLOW}clear:{Colors.RESET}         Clear the main conversation screen.")
-        self.log_to_display(f"{Colors.YELLOW}exit:{Colors.RESET}          Exit the application.")
+            key = self.ui.input_win.getch() 
+
+            if key == -1: 
+                time.sleep(0.01) 
+                continue 
+            
+            if key == ord('\t'):
+                self.ui.cycle_active_window()
+                self.ui.draw(self.stats) 
+                self.ui._draw_input_line(input_buffer) 
+                curses.doupdate()
+            elif key == curses.KEY_UP:
+                self.ui.scroll_active_window(-1, 1)
+                self.ui.draw(self.stats) 
+                self.ui._draw_input_line(input_buffer) 
+                curses.doupdate()
+            elif key == curses.KEY_DOWN:
+                self.ui.scroll_active_window(1, 1)
+                self.ui.draw(self.stats) 
+                self.ui._draw_input_line(input_buffer) 
+                curses.doupdate()
+            elif key == curses.KEY_PPAGE:
+                self.ui.scroll_active_window(-1, h // 2)
+                self.ui.draw(self.stats) 
+                self.ui._draw_input_line(input_buffer)
+                curses.doupdate()
+            elif key == curses.KEY_NPAGE:
+                self.ui.scroll_active_window(1, h // 2)
+                self.ui.draw(self.stats) 
+                self.ui._draw_input_line(input_buffer)
+                curses.doupdate()
+            elif key == curses.KEY_HOME:
+                self.ui.scroll_active_window(2, 0) 
+                self.ui.draw(self.stats) 
+                self.ui._draw_input_line(input_buffer)
+                curses.doupdate()
+            elif key == curses.KEY_END:
+                self.ui.scroll_active_window(0, 0) 
+                self.ui.draw(self.stats) 
+                self.ui._draw_input_line(input_buffer)
+                curses.doupdate()
+            elif key == curses.KEY_BACKSPACE or key == 127: 
+                input_buffer = input_buffer[:-1]
+                self.ui._draw_input_line(input_buffer) 
+                curses.doupdate()
+            elif key == ord('\n'): 
+                if input_buffer.lower() in ['exit', 'quit', 'q']: break
+                
+                self.ui._draw_input_line("")
+                curses.doupdate()
+
+                self.chat(input_buffer) 
+                input_buffer = "" 
+                
+                self.ui.draw(self.stats) 
+                self.ui._draw_input_line(input_buffer) 
+                curses.doupdate() 
+            elif 32 <= key <= 255: 
+                try:
+                    char = chr(key)
+                    input_buffer += char
+                    self.ui._draw_input_line(input_buffer) 
+                    curses.doupdate()
+                except ValueError:
+                    pass 
 
 def select_provider_from_list(prompt: str, options: List[Provider]) -> Provider:
     print(prompt)
@@ -515,6 +738,16 @@ def load_configuration() -> Optional[Dict]:
         except Exception as e: print(f"⚠️ Could not load configuration file: {e}"); return None
     return None
 
+def main_wrapper(stdscr, api_keys, primary_agent, model_selections):
+    bridge = MultiLLMAgentBridge(api_keys, primary_agent, model_selections)
+    
+    try:
+        bridge.run_curses(stdscr)
+    finally:
+        enum_model_selections = {Provider(k) if isinstance(k, str) else k: v for k, v in model_selections.items()}
+        save_configuration(primary_agent, enum_model_selections)
+        print("\n✅ Configuration saved. Exiting.")
+
 def main():
     print(f"🚀 Initializing Multi-LLM Agent Bridge v{VERSION}...")
     if not check_dependencies(): sys.exit(1)
@@ -527,7 +760,7 @@ def main():
     print("✅ All API keys loaded.")
     
     primary_agent: Optional[Provider] = None
-    model_selections: Optional[Dict[Provider, str]] = None
+    model_selections: Optional[Dict[str, str]] = None
     
     saved_config = load_configuration()
     if saved_config:
@@ -538,7 +771,7 @@ def main():
         
         if input("\nUse this configuration? (y/n): ").lower() == 'y':
             primary_agent = Provider(saved_config.get('primary_agent'))
-            model_selections = {Provider(k): v for k,v in saved_config.get('model_selections', {}).items()}
+            model_selections = {str(k): v for k, v in saved_config.get('model_selections', {}).items()}
 
     if not primary_agent or not model_selections:
         interfaces = {p: globals()[f"{p.name.capitalize()}Interface"](api_keys[p.value], "") for p in PROVIDERS if api_keys[p.value]}
@@ -548,23 +781,24 @@ def main():
         print("\n--- AGENT SETUP ---")
         primary_agent = select_provider_from_list("\n1. Select the Primary Agent (Provider):", list(interfaces.keys()))
 
-        model_selections = {}
+        model_selections_enum = {}
         print("\n2. Select the specific model for each provider:")
         for provider in interfaces.keys():
-            model_selections[provider] = select_model_from_grouped_list(f"  - {provider.value.capitalize()} Model:", available_models[provider], provider)
+            model_selections_enum[provider] = select_model_from_grouped_list(f"  - {provider.value.capitalize()} Model:", available_models[provider], provider)
+        model_selections = {p.value: m for p, m in model_selections_enum.items()}
 
-    logger.info(f"Primary Agent: {primary_agent.value}, Models: { {p.value: m for p,m in model_selections.items()} }")
+    logger.info(f"Primary Agent: {primary_agent.value}, Models: {model_selections}")
     print("\n🚀 Starting Multi-Pane Interface...")
     time.sleep(1)
 
-    str_model_selections = {p.value: m for p, m in model_selections.items()}
-    bridge = MultiLLMAgentBridge(api_keys, primary_agent, str_model_selections)
-    
-    try:
-        bridge.run()
-    finally:
-        save_configuration(primary_agent, model_selections)
-        print("\n✅ Configuration saved. Exiting.")
+    curses.wrapper(main_wrapper, api_keys, primary_agent, model_selections)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        pass
+    except Exception as e:
+        print(f"\n❌ An unexpected error occurred: {e}")
+        import traceback
+        traceback.print_exc()
