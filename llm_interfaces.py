@@ -1,859 +1,1218 @@
 #!/usr/bin/env python3
 """
-LLM Interfaces Module for Multi-LLM Bridge
-Version: 5.0.1
+Terminal UI Module for Multi-LLM Bridge
+Version: 5.1.0
 
-This module contains all LLM API interfaces and related functionality.
-Fixed: Gemini implementation based on working code
+This module contains all terminal UI components including multi-window and multi-pane layouts.
+Updated: Compact display with statistics integrated into title bars
+Fixed: Added dedicated status line support
 """
 
 import os
-import json
+import sys
+import time
+import shutil
+import signal
+import textwrap
 import logging
-from typing import Dict, List, Optional, Any, Union
+from typing import Dict, List, Optional, Any, Tuple, Union
+from datetime import datetime
+from enum import Enum
 from abc import ABC, abstractmethod
-from anthropic import Anthropic
-from openai import OpenAI
-import google.generativeai as genai
 
 # Get logger from main module
 logger = logging.getLogger("LLM_Bridge")
 
-# Detailed pricing information (per million tokens)
-PRICE_MAPPING = {
-    # Claude models
-    "claude-opus-4-20250514": {"input": 20.00, "output": 100.00},
-    "claude-sonnet-4-20250514": {"input": 4.00, "output": 20.00},
-    "claude-3-opus-20240229": {"input": 15.00, "output": 75.00},
-    "claude-3-sonnet-20240229": {"input": 3.00, "output": 15.00},
-    "claude-3-haiku-20240307": {"input": 0.25, "output": 1.25},
-    "claude-3-5-sonnet-20241022": {"input": 3.00, "output": 15.00},
-    "claude-3-5-haiku-20241022": {"input": 1.00, "output": 5.00},
+# ANSI color codes
+class Colors:
+    RESET = '\033[0m'
+    BLACK = '\033[30m'
+    RED = '\033[31m'
+    GREEN = '\033[32m'
+    YELLOW = '\033[33m'
+    BLUE = '\033[34m'
+    MAGENTA = '\033[35m'
+    CYAN = '\033[36m'
+    WHITE = '\033[37m'
     
-    # OpenAI models
-    "gpt-4o": {"input": 5.00, "output": 15.00},
-    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
-    "gpt-4o-2024-11-20": {"input": 2.50, "output": 10.00},
-    "gpt-4o-2024-08-06": {"input": 2.50, "output": 10.00},
-    "gpt-4o-2024-05-13": {"input": 5.00, "output": 15.00},
-    "gpt-4-turbo": {"input": 10.00, "output": 30.00},
-    "gpt-4-turbo-2024-04-09": {"input": 10.00, "output": 30.00},
-    "gpt-4-turbo-preview": {"input": 10.00, "output": 30.00},
-    "gpt-4-0125-preview": {"input": 10.00, "output": 30.00},
-    "gpt-4-1106-preview": {"input": 10.00, "output": 30.00},
-    "gpt-4": {"input": 30.00, "output": 60.00},
-    "gpt-4-0613": {"input": 30.00, "output": 60.00},
-    "gpt-4-32k": {"input": 60.00, "output": 120.00},
-    "gpt-3.5-turbo": {"input": 0.50, "output": 1.50},
-    "gpt-3.5-turbo-0125": {"input": 0.50, "output": 1.50},
-    "gpt-3.5-turbo-1106": {"input": 1.00, "output": 2.00},
-    "gpt-3.5-turbo-16k": {"input": 3.00, "output": 4.00},
-    "o1-preview": {"input": 15.00, "output": 60.00},
-    "o1-preview-2024-09-12": {"input": 15.00, "output": 60.00},
-    "o1-mini": {"input": 3.00, "output": 12.00},
-    "o1-mini-2024-09-12": {"input": 3.00, "output": 12.00},
+    # Bright colors
+    BRIGHT_BLACK = '\033[90m'
+    BRIGHT_RED = '\033[91m'
+    BRIGHT_GREEN = '\033[92m'
+    BRIGHT_YELLOW = '\033[93m'
+    BRIGHT_BLUE = '\033[94m'
+    BRIGHT_MAGENTA = '\033[95m'
+    BRIGHT_CYAN = '\033[96m'
+    BRIGHT_WHITE = '\033[97m'
     
-    # Gemini models
-    "gemini-2.0-flash-exp": {"input": 0.00, "output": 0.00},  # Experimental, free
-    "gemini-1.5-pro": {"input": 3.50, "output": 10.50},
-    "gemini-1.5-pro-latest": {"input": 3.50, "output": 10.50},
-    "gemini-1.5-flash": {"input": 0.35, "output": 1.05},
-    "gemini-1.5-flash-latest": {"input": 0.35, "output": 1.05},
-    "gemini-1.0-pro": {"input": 0.50, "output": 1.50},
-    "gemini-pro": {"input": 0.50, "output": 1.50},
-    "gemini-ultra": {"input": 7.00, "output": 21.00},  # Estimated
+    # Background colors
+    BG_BLACK = '\033[40m'
+    BG_RED = '\033[41m'
+    BG_GREEN = '\033[42m'
+    BG_YELLOW = '\033[43m'
+    BG_BLUE = '\033[44m'
+    BG_MAGENTA = '\033[45m'
+    BG_CYAN = '\033[46m'
+    BG_WHITE = '\033[47m'
+    
+    # Bright background colors
+    BG_BRIGHT_BLACK = '\033[100m'
+    BG_BRIGHT_RED = '\033[101m'
+    BG_BRIGHT_GREEN = '\033[102m'
+    BG_BRIGHT_YELLOW = '\033[103m'
+    BG_BRIGHT_BLUE = '\033[104m'
+    BG_BRIGHT_MAGENTA = '\033[105m'
+    BG_BRIGHT_CYAN = '\033[106m'
+    BG_BRIGHT_WHITE = '\033[107m'
+    
+    # Text styles
+    BOLD = '\033[1m'
+    DIM = '\033[2m'
+    ITALIC = '\033[3m'
+    UNDERLINE = '\033[4m'
+    BLINK = '\033[5m'
+    REVERSE = '\033[7m'
+    HIDDEN = '\033[8m'
+    STRIKETHROUGH = '\033[9m'
+
+# Box drawing characters (Unicode)
+class BoxChars:
+    # Single line
+    TL = '┌'  # Top-left
+    TR = '┐'  # Top-right
+    BL = '└'  # Bottom-left
+    BR = '┘'  # Bottom-right
+    H = '─'   # Horizontal
+    V = '│'   # Vertical
+    T = '┬'   # T-junction top
+    B = '┴'   # T-junction bottom
+    L = '├'   # T-junction left
+    R = '┤'   # T-junction right
+    X = '┼'   # Cross
+    
+    # Double line
+    D_TL = '╔'
+    D_TR = '╗'
+    D_BL = '╚'
+    D_BR = '╝'
+    D_H = '═'
+    D_V = '║'
+    
+    # Mixed
+    S_TO_D_L = '╞'
+    S_TO_D_R = '╡'
+    D_TO_S_L = '╟'
+    D_TO_S_R = '╢'
+
+# LLM Type for UI
+class LLMType(Enum):
+    CLAUDE = "claude"
+    OPENAI = "openai"
+    GEMINI = "gemini"
+
+# LLM Color mapping with icons
+LLM_COLORS = {
+    LLMType.CLAUDE: {
+        'bg': Colors.BG_MAGENTA,
+        'fg': Colors.WHITE,
+        'icon': '🧠',
+        'accent': Colors.BRIGHT_MAGENTA
+    },
+    LLMType.OPENAI: {
+        'bg': Colors.BG_BLUE,
+        'fg': Colors.WHITE,
+        'icon': '🤖',
+        'accent': Colors.BRIGHT_BLUE
+    },
+    LLMType.GEMINI: {
+        'bg': Colors.BG_GREEN,
+        'fg': Colors.WHITE,
+        'icon': '✨',
+        'accent': Colors.BRIGHT_GREEN
+    }
 }
 
-# Model configurations with descriptions
-CLAUDE_MODELS = [
-    ("claude-opus-4-20250514", "Claude Opus 4 - Most capable model for complex tasks"),
-    ("claude-sonnet-4-20250514", "Claude Sonnet 4 - Balanced performance and cost"),
-    ("claude-3-5-sonnet-20241022", "Claude 3.5 Sonnet - Latest balanced model"),
-    ("claude-3-5-haiku-20241022", "Claude 3.5 Haiku - Fast, cost-effective"),
-    ("claude-3-opus-20240229", "Claude 3 Opus (Legacy) - Previous flagship"),
-    ("claude-3-sonnet-20240229", "Claude 3 Sonnet (Legacy) - Previous balanced"),
-    ("claude-3-haiku-20240307", "Claude 3 Haiku (Legacy) - Previous fast model")
-]
 
-GEMINI_MODELS = [
-    ("gemini-2.0-flash-exp", "Gemini 2.0 Flash - Fast, experimental (free)"),
-    ("gemini-1.5-pro", "Gemini 1.5 Pro - Advanced reasoning, long context"),
-    ("gemini-1.5-flash", "Gemini 1.5 Flash - Fast and versatile"),
-    ("gemini-1.0-pro", "Gemini 1.0 Pro - Balanced performance"),
-    ("gemini-ultra", "Gemini Ultra - Most capable (when available)")
-]
-
-
-class LLMInterface(ABC):
-    """Abstract base class for LLM interfaces"""
+class BaseTerminalUI(ABC):
+    """Abstract base class for terminal UI implementations"""
     
-    @abstractmethod
-    def chat(self, messages: List[Dict[str, str]], **kwargs) -> Dict[str, Any]:
-        """Send a chat request to the LLM"""
-        pass
+    def __init__(self):
+        self.last_terminal_size = None
+        self.status_message = ""  # FIX: Add status message storage
+        self.install_resize_handler()
     
-    @abstractmethod
-    def estimate_cost(self, input_tokens: int, output_tokens: int, model: str) -> float:
-        """Estimate the cost of the API call"""
-        pass
+    def set_status(self, message: str):
+        """FIX: Set status message to display above prompt"""
+        self.status_message = message
+        self.refresh_display()
     
-    @abstractmethod
-    def get_model_list(self) -> List[str]:
-        """Get list of available models"""
-        pass
-    
-    @abstractmethod
-    def supports_tools(self) -> bool:
-        """Check if this LLM supports tool/function calling"""
-        pass
-    
-    @abstractmethod
-    def format_tool_response(self, tool_call_id: str, tool_result: Any) -> Dict[str, Any]:
-        """Format tool response for this LLM's expected format"""
-        pass
-
-
-class ClaudeInterface(LLMInterface):
-    """Interface for Claude API with comprehensive error handling"""
-    
-    def __init__(self, api_key: str, model: str):
-        if not api_key:
-            raise ValueError("Claude API key is required")
-        self.client = Anthropic(api_key=api_key)
-        self.model = model
-        logger.info(f"Initialized Claude interface with model: {model}")
+    def clear_status(self):
+        """FIX: Clear status message"""
+        self.status_message = ""
+        self.refresh_display()
         
-    def chat(self, messages: List[Dict[str, str]], system_prompt: Optional[str] = None, 
-             tools: Optional[List[Dict]] = None, **kwargs) -> Dict[str, Any]:
-        """Send a chat request to Claude"""
+    @abstractmethod
+    def refresh_display(self):
+        """Refresh the entire display"""
+        pass
+    
+    @abstractmethod
+    def add_message(self, source: str, message: str, message_type: str = "info"):
+        """Add a message to the display"""
+        pass
+    
+    def install_resize_handler(self):
+        """Install handler for terminal resize events"""
         try:
-            # Claude requires system prompt to be separate
-            filtered_messages = []
-            combined_system = ""
-            
-            for msg in messages:
-                if msg['role'] == 'system':
-                    if combined_system:
-                        combined_system += "\n\n" + msg['content']
-                    else:
-                        combined_system = msg['content']
-                else:
-                    # Handle complex message content
-                    if isinstance(msg.get('content'), list):
-                        # Already in Claude's expected format
-                        filtered_messages.append(msg)
-                    else:
-                        # Convert simple string to expected format
-                        filtered_messages.append({
-                            'role': msg['role'],
-                            'content': msg['content']
-                        })
-            
-            # Merge system prompts
-            if system_prompt:
-                if combined_system:
-                    combined_system = system_prompt + "\n\n" + combined_system
-                else:
-                    combined_system = system_prompt
-            
-            # Build request parameters
-            create_kwargs = {
-                'model': self.model,
-                'max_tokens': kwargs.get('max_tokens', 4096),
-                'messages': filtered_messages,
-                'temperature': kwargs.get('temperature', 0.7)
-            }
-            
-            if combined_system:
-                create_kwargs['system'] = combined_system
-            if tools:
-                create_kwargs['tools'] = tools
-            if 'stop_sequences' in kwargs:
-                create_kwargs['stop_sequences'] = kwargs['stop_sequences']
-                
-            logger.debug(f"Claude request - Model: {self.model}, Messages: {len(filtered_messages)}, Tools: {len(tools) if tools else 0}")
-            response = self.client.messages.create(**create_kwargs)
-            
-            # Extract content - handle both TextBlock objects and dicts
-            content = []
-            tool_calls = []
-            
-            for block in response.content:
-                if hasattr(block, 'type'):
-                    # Handle Anthropic SDK objects
-                    if block.type == "text":
-                        content.append({"type": "text", "text": block.text})
-                    elif block.type == "tool_use":
-                        tool_calls.append({
-                            'id': block.id,
-                            'name': block.name,
-                            'input': block.input
-                        })
-                elif isinstance(block, dict):
-                    # Handle dict responses
-                    if block.get('type') == 'text':
-                        content.append(block)
-                    elif block.get('type') == 'tool_use':
-                        tool_calls.append({
-                            'id': block['id'],
-                            'name': block['name'],
-                            'input': block['input']
-                        })
-                else:
-                    # Fallback for unexpected types
-                    logger.warning(f"Unexpected content block type: {type(block)}")
-                    if hasattr(block, 'text'):
-                        content.append({"type": "text", "text": str(block.text)})
-            
-            result = {
-                'success': True,
-                'content': content,
-                'tool_calls': tool_calls,
-                'usage': {
-                    'input_tokens': response.usage.input_tokens,
-                    'output_tokens': response.usage.output_tokens,
-                    'total_tokens': response.usage.input_tokens + response.usage.output_tokens
-                },
-                'raw_response': response,
-                'model': self.model,
-                'stop_reason': getattr(response, 'stop_reason', None)
-            }
-            
-            logger.debug(f"Claude response - Tokens: {result['usage']['total_tokens']}, Tool calls: {len(tool_calls)}")
-            return result
-            
-        except Exception as e:
-            logger.error(f"Claude API error: {str(e)}", exc_info=True)
-            return {
-                'success': False, 
-                'error': str(e),
-                'error_type': type(e).__name__
-            }
+            if hasattr(signal, 'SIGWINCH'):
+                signal.signal(signal.SIGWINCH, self._handle_resize)
+        except:
+            pass
     
-    def handle_tool_result(self, messages: List[Dict], tool_use_id: str, tool_result: Any,
-                          system_prompt: Optional[str] = None, tools: Optional[List[Dict]] = None) -> Dict[str, Any]:
-        """Handle tool result and get Claude's response"""
-        # Format tool result for Claude
-        tool_result_content = tool_result if isinstance(tool_result, str) else json.dumps(tool_result)
+    def _handle_resize(self, signum, frame):
+        """Handle terminal resize signal"""
+        self.last_terminal_size = None
+    
+    def clear_screen(self):
+        """Clear the terminal screen"""
+        if os.name == 'nt':
+            os.system('cls')
+        else:
+            print('\033[2J\033[H', end='')
+            sys.stdout.flush()
+    
+    def move_cursor(self, row: int, col: int):
+        """Move cursor to specific position"""
+        print(f"\033[{row};{col}H", end='')
+        sys.stdout.flush()
+    
+    def get_terminal_size(self) -> Tuple[int, int]:
+        """Get terminal dimensions (columns, lines)"""
+        try:
+            size = shutil.get_terminal_size()
+            return (size.columns, size.lines)
+        except:
+            return (120, 40)
+    
+    def hide_cursor(self):
+        """Hide terminal cursor"""
+        print('\033[?25l', end='')
+        sys.stdout.flush()
+    
+    def show_cursor(self):
+        """Show terminal cursor"""
+        print('\033[?25h', end='')
+        sys.stdout.flush()
+    
+    def save_cursor_position(self):
+        """Save current cursor position"""
+        print('\033[s', end='')
+        sys.stdout.flush()
+    
+    def restore_cursor_position(self):
+        """Restore saved cursor position"""
+        print('\033[u', end='')
+        sys.stdout.flush()
+
+
+class StandardUI(BaseTerminalUI):
+    """Standard single-window terminal UI"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__()
+        self.config = config
+        self.messages = []
+        self.max_messages = 1000
         
-        # Add tool result to messages
-        messages.append({
-            "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": tool_use_id,
-                "content": tool_result_content
-            }]
-        })
+    def add_message(self, source: str, message: str, message_type: str = "info"):
+        """Add a message to the display"""
+        # FIX: Check for status messages
+        status_keywords = [
+            "responding `tool_result` block",
+            "processing tool call",
+            "waiting for response",
+            "executing tool:",
+            "[thinking]",
+            "self-query in progress"
+        ]
         
-        # Get Claude's response after tool use
-        return self.chat(messages, system_prompt=system_prompt, tools=tools)
-    
-    def estimate_cost(self, input_tokens: int, output_tokens: int, model: str) -> float:
-        """Estimate cost for Claude usage"""
-        pricing = PRICE_MAPPING.get(model, {"input": 15.0, "output": 75.0})
-        input_cost = (input_tokens / 1_000_000) * pricing["input"]
-        output_cost = (output_tokens / 1_000_000) * pricing["output"]
-        total_cost = round(input_cost + output_cost, 6)
+        is_status = any(keyword in message.lower() for keyword in status_keywords)
         
-        logger.debug(f"Claude cost calculation - Model: {model}, Input: ${input_cost:.6f}, Output: ${output_cost:.6f}, Total: ${total_cost:.6f}")
-        return total_cost
+        if is_status:
+            # For standard UI, print status messages with special formatting
+            print(f"\r{Colors.YELLOW}[{message}]{Colors.RESET}")
+            return
+        
+        # Regular message handling
+        timestamp = ""
+        if self.config.get('SHOW_TIMESTAMPS', True):
+            timestamp = datetime.now().strftime("[%H:%M:%S] ")
+        
+        # Format message based on type
+        if message_type == "user":
+            formatted = f"{timestamp}{Colors.GREEN}{Colors.BOLD}You:{Colors.RESET} {message}"
+        elif message_type == "assistant":
+            formatted = f"{timestamp}{Colors.CYAN}{Colors.BOLD}{source}:{Colors.RESET} {message}"
+        elif message_type == "error":
+            formatted = f"{timestamp}{Colors.RED}{Colors.BOLD}Error:{Colors.RESET} {message}"
+        elif message_type == "system":
+            formatted = f"{timestamp}{Colors.YELLOW}{message}{Colors.RESET}"
+        elif message_type == "tool":
+            formatted = f"{timestamp}{Colors.MAGENTA}🔧 {message}{Colors.RESET}"
+        else:
+            formatted = f"{timestamp}{message}"
+        
+        self.messages.append(formatted)
+        
+        # Limit message history
+        if len(self.messages) > self.max_messages:
+            self.messages = self.messages[-self.max_messages:]
+        
+        # Print immediately in standard mode
+        print(formatted)
     
-    def get_model_list(self) -> List[str]:
-        """Get list of available Claude models"""
-        models = sorted([m for m in PRICE_MAPPING if "claude" in m], reverse=True)
-        return models
+    def refresh_display(self):
+        """In standard mode, we don't need to refresh"""
+        pass
     
-    def supports_tools(self) -> bool:
-        """Claude supports tool/function calling"""
-        return True
+    def show_statistics(self, stats: Dict[str, Any]):
+        """Display statistics"""
+        print(f"\n{Colors.BOLD}{Colors.YELLOW}📊 Session Statistics:{Colors.RESET}")
+        print("=" * 60)
+        print(f"Total messages: {stats['total_messages']}")
+        print(f"Total tokens: {stats['total_tokens']:,}")
+        print(f"Total cost: ${stats['total_cost']:.4f}")
+        print(f"Session duration: {stats['session_duration_minutes']:.1f} minutes")
+        
+        if 'llm_stats' in stats:
+            print(f"\n{Colors.BOLD}{Colors.YELLOW}Per-Model Statistics:{Colors.RESET}")
+            for llm_name, llm_stats in stats['llm_stats'].items():
+                if llm_stats.get('message_count', 0) > 0:
+                    print(f"\n{Colors.CYAN}{llm_name}:{Colors.RESET}")
+                    print(f"  Messages: {llm_stats['message_count']}")
+                    print(f"  Tokens: {llm_stats['total_tokens']:,}")
+                    print(f"  Cost: ${llm_stats['total_cost']:.4f}")
+        print("=" * 60)
+
+
+class MultiWindowUI(BaseTerminalUI):
+    """Multi-window terminal UI with separate windows for each LLM - Compact version"""
     
-    def format_tool_response(self, tool_call_id: str, tool_result: Any) -> Dict[str, Any]:
-        """Format tool response for Claude"""
+    def __init__(self, main_llm: LLMType, sub_llms: List[LLMType], config: Dict[str, Any]):
+        super().__init__()
+        self.main_llm = main_llm
+        self.sub_llms = sub_llms
+        self.config = config
+        self.windows = {}  # Dict of LLMType -> window data
+        
+        # Initialize window data
+        self.windows[main_llm] = {
+            'lines': [],
+            'stats': self._init_stats(main_llm),
+            'is_main': True,
+            'scroll_offset': 0,
+            'title': f"{main_llm.value.upper()} [MAIN]"
+        }
+        
+        for llm in sub_llms:
+            self.windows[llm] = {
+                'lines': [],
+                'stats': self._init_stats(llm),
+                'is_main': False,
+                'scroll_offset': 0,
+                'title': f"{llm.value.upper()} [SUB]"
+            }
+        
+        self.max_lines_per_window = 2000
+        self.status_height = 1  # Reduced from 3 to 1 - single line for title + stats
+        self.divider_height = 1
+        self.input_height = 2
+        self.active_window = main_llm
+        
+    def _init_stats(self, llm_type: LLMType) -> Dict[str, Any]:
+        """Initialize stats for an LLM"""
         return {
-            "type": "tool_result",
-            "tool_use_id": tool_call_id,
-            "content": json.dumps(tool_result) if not isinstance(tool_result, str) else tool_result
+            'message_count': 0,
+            'total_tokens': 0,
+            'input_tokens': 0,
+            'output_tokens': 0,
+            'estimated_cost': 0.0,
+            'last_model': self.config.get('SELECTED_MODELS', {}).get(llm_type, 'unknown')
         }
-
-
-class OpenAIInterface(LLMInterface):
-    """Interface for OpenAI API with comprehensive features"""
     
-    def __init__(self, api_key: str, model: str):
-        if not api_key:
-            raise ValueError("OpenAI API key is required")
-        self.client = OpenAI(api_key=api_key)
-        self.model = model
-        logger.info(f"Initialized OpenAI interface with model: {model}")
+    def calculate_layout(self, term_height: int, term_width: int) -> Dict[str, Any]:
+        """Calculate window layout based on number of windows"""
+        # FIX: Reserve space for status line
+        status_lines = 1 if self.status_message else 0
+        available_height = term_height - self.input_height - status_lines
+        num_windows = len(self.windows)
         
-    def chat(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]] = None, **kwargs) -> Dict[str, Any]:
-        """Send a chat request to OpenAI"""
-        try:
-            # Prepare messages - ensure all have proper format
-            formatted_messages = []
-            for msg in messages:
-                if isinstance(msg.get('content'), list):
-                    # Handle complex content (e.g., from tool results)
-                    formatted_messages.append(msg)
-                else:
-                    formatted_messages.append({
-                        'role': msg['role'],
-                        'content': msg.get('content', '')
-                    })
-            
-            create_kwargs = {
-                'model': self.model,
-                'messages': formatted_messages,
-                'temperature': kwargs.get('temperature', 0.7)
-            }
-            
-            # Add optional parameters
-            if 'max_tokens' in kwargs:
-                create_kwargs['max_tokens'] = kwargs['max_tokens']
-            if 'top_p' in kwargs:
-                create_kwargs['top_p'] = kwargs['top_p']
-            if 'frequency_penalty' in kwargs:
-                create_kwargs['frequency_penalty'] = kwargs['frequency_penalty']
-            if 'presence_penalty' in kwargs:
-                create_kwargs['presence_penalty'] = kwargs['presence_penalty']
-            if 'stop' in kwargs:
-                create_kwargs['stop'] = kwargs['stop']
-            if 'response_format' in kwargs:
-                create_kwargs['response_format'] = kwargs['response_format']
-                
-            if tools:
-                # Convert tools to OpenAI format
-                openai_tools = []
-                for tool in tools:
-                    openai_tools.append({
-                        'type': 'function',
-                        'function': {
-                            'name': tool['name'],
-                            'description': tool['description'],
-                            'parameters': tool['input_schema']
-                        }
-                    })
-                create_kwargs['tools'] = openai_tools
-                create_kwargs['tool_choice'] = kwargs.get('tool_choice', 'auto')
-            
-            logger.debug(f"OpenAI request - Model: {self.model}, Messages: {len(formatted_messages)}, Tools: {len(tools) if tools else 0}")
-            response = self.client.chat.completions.create(**create_kwargs)
-            
-            # Extract content and tool calls
-            content = []
-            tool_calls = []
-            
-            message = response.choices[0].message
-            if message.content:
-                content.append({"type": "text", "text": message.content})
-            
-            if hasattr(message, 'tool_calls') and message.tool_calls:
-                for tc in message.tool_calls:
-                    tool_calls.append({
-                        'id': tc.id,
-                        'name': tc.function.name,
-                        'input': json.loads(tc.function.arguments)
-                    })
-            
-            result = {
-                'success': True,
-                'content': content,
-                'tool_calls': tool_calls,
-                'usage': {
-                    'input_tokens': response.usage.prompt_tokens,
-                    'output_tokens': response.usage.completion_tokens,
-                    'total_tokens': response.usage.total_tokens
-                },
-                'raw_response': response,
-                'model': self.model,
-                'finish_reason': response.choices[0].finish_reason
-            }
-            
-            logger.debug(f"OpenAI response - Tokens: {result['usage']['total_tokens']}, Tool calls: {len(tool_calls)}")
-            return result
-            
-        except Exception as e:
-            logger.error(f"OpenAI API error: {str(e)}", exc_info=True)
-            return {
-                'success': False, 
-                'error': str(e),
-                'error_type': type(e).__name__
-            }
-    
-    def handle_tool_result(self, messages: List[Dict], tool_call_id: str, tool_result: Any,
-                          tools: Optional[List[Dict]] = None) -> Dict[str, Any]:
-        """Handle tool result and get OpenAI's response"""
-        # Add tool result message
-        tool_message = {
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "content": json.dumps(tool_result) if not isinstance(tool_result, str) else tool_result
-        }
-        messages.append(tool_message)
+        # Calculate height for each window
+        total_dividers = (num_windows - 1) * self.divider_height
+        window_space = available_height - total_dividers
         
-        # Get OpenAI's response after tool use
-        return self.chat(messages, tools=tools)
+        # Distribute space
+        if num_windows == 1:
+            window_heights = [window_space]
+        elif num_windows == 2:
+            # Main window gets 60%
+            main_height = int(window_space * 0.6)
+            window_heights = [main_height, window_space - main_height]
+        elif num_windows == 3:
+            # Main window gets 40%
+            main_height = int(window_space * 0.4)
+            remaining = window_space - main_height
+            window_heights = [main_height, remaining // 2, remaining - (remaining // 2)]
+        else:
+            # Equal distribution
+            base_height = window_space // num_windows
+            window_heights = [base_height] * num_windows
+            # Adjust for rounding
+            window_heights[-1] = window_space - sum(window_heights[:-1])
+        
+        # Build layout
+        layout = {'windows': [], 'input_row': term_height - 1}
+        current_row = 1
+        
+        # Main window first
+        window_list = [self.main_llm] + self.sub_llms
+        
+        for i, (llm_type, height) in enumerate(zip(window_list, window_heights)):
+            if i > 0:
+                current_row += self.divider_height
+            
+            layout['windows'].append({
+                'llm': llm_type,
+                'start_row': current_row,
+                'status_rows': self.status_height,
+                'content_start': current_row + self.status_height,
+                'content_height': max(1, height - self.status_height),
+                'total_height': height,
+                'is_active': llm_type == self.active_window
+            })
+            current_row += height
+        
+        return layout
     
-    def estimate_cost(self, input_tokens: int, output_tokens: int, model: str) -> float:
-        """Estimate cost for OpenAI usage"""
-        pricing = PRICE_MAPPING.get(model)
-        if not pricing:
-            # Default pricing based on model family
-            if 'gpt-4o' in model:
-                pricing = {"input": 5.0, "output": 15.0}
-            elif 'gpt-4' in model:
-                if '32k' in model:
-                    pricing = {"input": 60.0, "output": 120.0}
-                elif 'turbo' in model:
-                    pricing = {"input": 10.0, "output": 30.0}
-                else:
-                    pricing = {"input": 30.0, "output": 60.0}
-            elif 'o1' in model:
-                if 'mini' in model:
-                    pricing = {"input": 3.0, "output": 12.0}
-                else:
-                    pricing = {"input": 15.0, "output": 60.0}
+    def draw_window(self, window_info: Dict[str, Any], term_width: int):
+        """Draw a single window with compact header"""
+        llm_type = window_info['llm']
+        window_data = self.windows[llm_type]
+        colors = LLM_COLORS[llm_type]
+        
+        # Draw compact status bar (title + stats on one line)
+        self.draw_compact_status_bar(
+            window_info['start_row'],
+            term_width,
+            llm_type,
+            window_data['stats'],
+            window_info['is_active']
+        )
+        
+        # Draw content area
+        lines = window_data['lines']
+        scroll_offset = window_data.get('scroll_offset', 0)
+        content_height = window_info['content_height']
+        
+        # Calculate visible range
+        total_lines = len(lines)
+        if scroll_offset > 0:
+            start_idx = max(0, total_lines - content_height - scroll_offset)
+            end_idx = max(0, total_lines - scroll_offset)
+        else:
+            start_idx = max(0, total_lines - content_height)
+            end_idx = total_lines
+        
+        display_lines = lines[start_idx:end_idx]
+        
+        # Clear and draw content
+        for i in range(content_height):
+            row = window_info['content_start'] + i
+            self.move_cursor(row, 1)
+            
+            if i < len(display_lines):
+                line = display_lines[i]
+                # Truncate long lines
+                if len(line) > term_width - 2:
+                    line = line[:term_width - 5] + "..."
+                print(line + " " * (term_width - len(line)))
             else:
-                pricing = {"input": 0.5, "output": 1.5}
+                print(" " * term_width)
+    
+    def draw_compact_status_bar(self, row: int, width: int, llm_type: LLMType, stats: Dict[str, Any], is_active: bool):
+        """Draw compact status bar with all info on one line"""
+        colors = LLM_COLORS[llm_type]
         
-        input_cost = (input_tokens / 1_000_000) * pricing["input"]
-        output_cost = (output_tokens / 1_000_000) * pricing["output"]
-        total_cost = round(input_cost + output_cost, 6)
+        self.move_cursor(row, 1)
         
-        logger.debug(f"OpenAI cost calculation - Model: {model}, Input: ${input_cost:.6f}, Output: ${output_cost:.6f}, Total: ${total_cost:.6f}")
-        return total_cost
-    
-    def get_model_list(self) -> List[str]:
-        """Get list of available OpenAI models"""
-        try:
-            models = self.client.models.list()
-            gpt_models = []
-            
-            # Filter for relevant models
-            relevant_prefixes = ["gpt-4o", "gpt-4", "gpt-3.5", "o1", "o3", "chatgpt"]
-            excluded_suffixes = ["-instruct", "-edit", "-search", "-similarity", "-embedding"]
-            
-            for model in models.data:
-                model_id = model.id
-                
-                # Check if it's a relevant model
-                if any(prefix in model_id for prefix in relevant_prefixes):
-                    # Exclude certain model types
-                    if not any(suffix in model_id for suffix in excluded_suffixes):
-                        gpt_models.append(model_id)
-            
-            # Sort with custom logic to put newer models first
-            def model_sort_key(m):
-                # Priority order for model families
-                if 'gpt-4o' in m:
-                    priority = 0
-                elif 'o1' in m:
-                    priority = 1
-                elif 'gpt-4' in m and 'turbo' in m:
-                    priority = 2
-                elif 'gpt-4' in m:
-                    priority = 3
-                elif 'gpt-3.5' in m:
-                    priority = 4
-                else:
-                    priority = 5
-                
-                # Extract date if present (e.g., "2024-04-09")
-                import re
-                date_match = re.search(r'(\d{4}-\d{2}-\d{2})', m)
-                date_str = date_match.group(1) if date_match else "0000-00-00"
-                
-                return (priority, date_str, m)
-            
-            gpt_models.sort(key=model_sort_key, reverse=True)
-            
-            logger.info(f"Found {len(gpt_models)} OpenAI models")
-            return gpt_models
-            
-        except Exception as e:
-            logger.error(f"Failed to fetch OpenAI models: {e}")
-            # Fallback to known models
-            return sorted([m for m in PRICE_MAPPING if any(p in m for p in ["gpt", "o1"])], reverse=True)
-    
-    def supports_tools(self) -> bool:
-        """OpenAI supports function calling for most models"""
-        # O1 models don't support tools yet
-        return not ('o1' in self.model.lower())
-    
-    def format_tool_response(self, tool_call_id: str, tool_result: Any) -> Dict[str, Any]:
-        """Format tool response for OpenAI"""
-        return {
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "content": json.dumps(tool_result) if not isinstance(tool_result, str) else tool_result
-        }
-
-
-class GeminiInterface(LLMInterface):
-    """Interface for Google Gemini API with advanced features - Fixed implementation"""
-    
-    def __init__(self, api_key: str, model: str):
-        if not api_key:
-            raise ValueError("Gemini API key is required")
-        genai.configure(api_key=api_key)
-        self.model_name = model
-        self.model = None  # Will be created per request with different configs
-        logger.info(f"Initialized Gemini interface with model: {model}")
+        # Build status line components
+        title = f" {colors['icon']} {self.windows[llm_type]['title']}"
+        model = stats['last_model']
         
-    def chat(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]] = None, **kwargs) -> Dict[str, Any]:
-        """Send a chat request to Gemini - Fixed implementation"""
-        try:
-            # Extract system prompt from messages
-            system_content = ""
-            history = []
-            
-            # Convert messages to Gemini format
-            for msg in messages:
-                if msg['role'] == 'system':
-                    system_content += msg['content'] + "\n\n"
-                else:
-                    # Convert role names
-                    role = "user" if msg["role"] == "user" else "model"
-                    content = msg.get('content')
-                    
-                    # Handle content that might be a list
-                    if isinstance(content, list):
-                        # Extract text from content list
-                        text_parts = []
-                        for c in content:
-                            if isinstance(c, dict) and c.get('type') == 'text':
-                                text_parts.append(c.get('text', ''))
-                            elif isinstance(c, dict) and c.get('type') == 'tool_result':
-                                # Handle tool results
-                                text_parts.append(f"Tool result: {c.get('content', '')}")
-                        text = " ".join(text_parts)
-                        history.append({'role': role, 'parts': [text]})
-                    else:
-                        # Simple string content
-                        history.append({'role': role, 'parts': [content]})
-            
-            # Prepare system instruction
-            system_instruction = system_content.strip() if system_content else None
-            
-            # Convert tools to Gemini format
-            gemini_tools = None
-            if tools:
-                function_declarations = []
-                for tool in tools:
-                    function_declarations.append({
-                        "name": tool['name'],
-                        "description": tool['description'],
-                        "parameters": tool['input_schema']
-                    })
-                gemini_tools = [{"function_declarations": function_declarations}]
-            
-            # Create generation config
-            generation_config = genai.GenerationConfig(
-                temperature=kwargs.get('temperature', 0.7),
-                top_p=kwargs.get('top_p', 0.95),
-                top_k=kwargs.get('top_k', 40),
-                max_output_tokens=kwargs.get('max_tokens', 8192),
-                stop_sequences=kwargs.get('stop_sequences', None)
+        # Log what we're drawing
+        logger.debug(f"Drawing status bar for {llm_type.value}: {title}")
+        
+        # Shorten model name if needed
+        if len(model) > 20:
+            model = model[:17] + "..."
+        
+        # Compact stats
+        msg = f"M:{stats['message_count']}"
+        tok = f"T:{stats['total_tokens']:,}"
+        if stats['total_tokens'] >= 1000000:
+            tok = f"T:{stats['total_tokens']/1000000:.1f}M"
+        elif stats['total_tokens'] >= 1000:
+            tok = f"T:{stats['total_tokens']/1000:.0f}k"
+        
+        cost = f"${stats['estimated_cost']:.2f}"
+        
+        # Add scroll indicator
+        scroll = ""
+        if self.windows[llm_type].get('scroll_offset', 0) > 0:
+            scroll = " [SCROLL]"
+        
+        # Calculate available space
+        stats_text = f" {msg} {tok} {cost}{scroll} "
+        model_text = f" [{model}]"
+        
+        # Available space for spacing
+        total_fixed_width = len(title) + len(model_text) + len(stats_text)
+        spacing = max(1, width - total_fixed_width)
+        
+        # Build complete line
+        if spacing > 0:
+            line = f"{title}{model_text}{' ' * spacing}{stats_text}"
+        else:
+            # Not enough space, truncate model
+            line = f"{title} {msg} {tok} {cost}{scroll} "
+        
+        # Ensure line fits
+        if len(line) > width:
+            line = line[:width]
+        else:
+            line = line.ljust(width)
+        
+        # Draw with appropriate colors
+        if is_active:
+            print(f"{colors['bg']}{Colors.BOLD}{Colors.WHITE}{line}{Colors.RESET}")
+        else:
+            print(f"{Colors.BG_BLUE}{Colors.BRIGHT_WHITE}{line}{Colors.RESET}")
+    
+    def draw_divider(self, row: int, width: int):
+        """Draw divider between windows"""
+        self.move_cursor(row, 1)
+        print(f"{Colors.BLUE}{'═' * width}{Colors.RESET}")
+    
+    def add_line(self, llm_type: LLMType, line: str):
+        """Add line to specific window with word wrapping"""
+        if llm_type not in self.windows:
+            logger.error(f"add_line: LLMType {llm_type} not found in windows! Available: {list(self.windows.keys())}")
+            return
+        
+        logger.debug(f"add_line: Adding to {llm_type.value} window: {line[:50]}...")
+        
+        # Handle newlines
+        if '\n' in line:
+            for sub_line in line.split('\n'):
+                if sub_line:  # Skip empty lines from split
+                    self.add_line(llm_type, sub_line)
+            return
+        
+        # Get terminal width for wrapping
+        term_width, _ = self.get_terminal_size()
+        max_width = max(40, term_width - 4)
+        
+        # Apply truncation if verbose is off
+        if not self.config.get('VERBOSE_DISPLAY', True) and len(line) > max_width * 2:
+            line = line[:max_width * 2 - 3] + "..."
+        
+        # Wrap long lines
+        if len(line) > max_width:
+            wrapped_lines = textwrap.wrap(
+                line, 
+                width=max_width,
+                break_long_words=True,
+                break_on_hyphens=True,
+                expand_tabs=False,
+                replace_whitespace=False
             )
-            
-            # Create model with configuration
-            self.model = genai.GenerativeModel(
-                self.model_name,
-                system_instruction=system_instruction,
-                tools=gemini_tools,
-                generation_config=generation_config
-            )
-            
-            # Extract the latest prompt from history
-            latest_prompt = []
-            if history and history[-1]['role'] == 'user':
-                latest_prompt = history[-1]['parts']
-                history = history[:-1]  # Remove the last message from history
-            elif not history:
-                # No history, no prompt
-                latest_prompt = ["Hello"]
-            
-            logger.debug(f"Gemini request - Model: {self.model_name}, History: {len(history)}, Tools: {len(tools) if tools else 0}")
-            
-            # Start chat with history
-            chat = self.model.start_chat(history=history)
-            
-            # Send message
-            response = chat.send_message(latest_prompt, stream=False)
-            
-            # Extract content from response
-            content = []
-            tool_calls = []
-            output_text = ""
-            
-            if response.candidates and response.candidates[0].content.parts:
-                for part in response.candidates[0].content.parts:
-                    if hasattr(part, 'function_call') and part.function_call:
-                        fc = part.function_call
-                        tool_calls.append({
-                            'id': fc.name,  # Gemini uses name as ID
-                            'name': fc.name,
-                            'input': dict(fc.args) if fc.args else {}
-                        })
-                    elif hasattr(part, 'text'):
-                        output_text += part.text
-            
-            if output_text:
-                content.append({"type": "text", "text": output_text})
-            
-            # Calculate token usage
-            try:
-                # Count tokens for input (entire chat history)
-                input_tokens = self.model.count_tokens(chat.history).total_tokens
-                
-                # Count tokens for output
-                output_tokens = 0
-                if output_text:
-                    output_tokens = self.model.count_tokens(output_text).total_tokens
-            except:
-                # Fallback token estimation
-                input_tokens = sum(len(str(h['parts'])) for h in history) // 4
-                output_tokens = len(output_text) // 4 if output_text else 0
-            
-            result = {
-                'success': True,
-                'content': content,
-                'tool_calls': tool_calls,
-                'usage': {
-                    'input_tokens': int(input_tokens),
-                    'output_tokens': int(output_tokens),
-                    'total_tokens': int(input_tokens + output_tokens)
-                },
-                'raw_response': response,
-                'model': self.model_name,
-                'finish_reason': str(response.candidates[0].finish_reason) if response.candidates else None
-            }
-            
-            logger.debug(f"Gemini response - Tokens: {result['usage']['total_tokens']}, Tool calls: {len(tool_calls)}")
-            return result
-            
-        except Exception as e:
-            logger.error(f"Gemini API error: {str(e)}", exc_info=True)
-            return {
-                'success': False, 
-                'error': str(e),
-                'error_type': type(e).__name__
-            }
-    
-    def handle_tool_result(self, messages: List[Dict], tool_call_id: str, tool_result: Any,
-                          tools: Optional[List[Dict]] = None) -> Dict[str, Any]:
-        """Handle tool result and get Gemini's response"""
-        # Gemini handles tool results as regular user messages
-        tool_message = {
-            "role": "user",
-            "content": f"Function {tool_call_id} returned: {json.dumps(tool_result) if not isinstance(tool_result, str) else tool_result}"
-        }
-        messages.append(tool_message)
+            for wrapped_line in wrapped_lines:
+                self.windows[llm_type]['lines'].append(wrapped_line)
+        else:
+            self.windows[llm_type]['lines'].append(line)
         
-        # Get Gemini's response after tool use
-        return self.chat(messages, tools=tools)
+        # Reset scroll offset
+        self.windows[llm_type]['scroll_offset'] = 0
+        
+        # Limit history
+        while len(self.windows[llm_type]['lines']) > self.max_lines_per_window:
+            self.windows[llm_type]['lines'].pop(0)
     
-    def estimate_cost(self, input_tokens: int, output_tokens: int, model: str) -> float:
-        """Estimate cost for Gemini usage"""
-        pricing = PRICE_MAPPING.get(model)
-        if not pricing:
-            # Default pricing based on model family
-            if 'gemini-2' in model:
-                pricing = {"input": 0.0, "output": 0.0}  # Free experimental
-            elif 'flash' in model:
-                pricing = {"input": 0.35, "output": 1.05}
-            elif 'pro' in model:
-                pricing = {"input": 3.5, "output": 10.5}
-            elif 'ultra' in model:
-                pricing = {"input": 7.0, "output": 21.0}
+    def add_message(self, source: str, message: str, message_type: str = "info"):
+        """Add a message to the appropriate window"""
+        # Determine target window
+        target_llm = None
+        
+        # Check if source matches any window's LLM type
+        for llm_type in self.windows:
+            # Match both the enum value and the display name
+            if (llm_type.value.lower() == source.lower() or 
+                llm_type.name.lower() == source.lower()):
+                target_llm = llm_type
+                break
+        
+        # If no match found, default to main LLM
+        if not target_llm:
+            # Check if it's a system message that should go to main
+            if source.lower() in ['system', 'you', 'user']:
+                target_llm = self.main_llm
             else:
-                pricing = {"input": 1.0, "output": 3.0}
+                # Log unmapped source
+                logger.warning(f"Could not map source '{source}' to any LLM window, using main LLM")
+                target_llm = self.main_llm
         
-        input_cost = (input_tokens / 1_000_000) * pricing["input"]
-        output_cost = (output_tokens / 1_000_000) * pricing["output"]
-        total_cost = round(input_cost + output_cost, 6)
+        # Format message
+        timestamp = ""
+        if self.config.get('SHOW_TIMESTAMPS', True):
+            timestamp = datetime.now().strftime("[%H:%M:%S] ")
         
-        logger.debug(f"Gemini cost calculation - Model: {model}, Input: ${input_cost:.6f}, Output: ${output_cost:.6f}, Total: ${total_cost:.6f}")
-        return total_cost
+        # Apply formatting based on message type
+        if message_type == "user":
+            formatted = f"{timestamp}{Colors.GREEN}{Colors.BOLD}You:{Colors.RESET} {message}"
+        elif message_type == "assistant":
+            formatted = f"{timestamp}{Colors.CYAN}{Colors.BOLD}{source}:{Colors.RESET} {message}"
+        elif message_type == "error":
+            formatted = f"{timestamp}{Colors.RED}{Colors.BOLD}Error:{Colors.RESET} {message}"
+        elif message_type == "system":
+            formatted = f"{timestamp}{Colors.YELLOW}{message}{Colors.RESET}"
+        elif message_type == "tool":
+            formatted = f"{timestamp}{Colors.MAGENTA}🔧 {message}{Colors.RESET}"
+        else:
+            formatted = f"{timestamp}{message}"
+        
+        self.add_line(target_llm, formatted)
     
-    def get_model_list(self) -> List[str]:
-        """Get list of available Gemini models"""
-        try:
-            models = []
-            excluded_keywords = ['-tts', '-embedding', '-aqa', 'embedding', 'aqa']
-            
-            for m in genai.list_models():
-                # Check if model supports content generation
-                if 'generateContent' in m.supported_generation_methods:
-                    model_name = m.name
-                    
-                    # Clean up model name
-                    if model_name.startswith('models/'):
-                        model_name = model_name[len('models/'):]
-                    
-                    # Exclude non-generation models
-                    if not any(keyword in model_name.lower() for keyword in excluded_keywords):
-                        models.append(model_name)
-            
-            # Add known models if not in list
-            known_models = [m for m in PRICE_MAPPING if "gemini" in m]
-            for known_model in known_models:
-                if known_model not in models:
-                    models.append(known_model)
-            
-            # Sort with newest first
-            models.sort(reverse=True)
-            
-            logger.info(f"Found {len(models)} Gemini models")
-            return models
-            
-        except Exception as e:
-            logger.error(f"Failed to fetch Gemini models: {e}")
-            # Fallback to known models
-            return sorted([m for m in PRICE_MAPPING if "gemini" in m], reverse=True)
+    def update_stats(self, llm_type: LLMType, **kwargs):
+        """Update statistics for specific LLM"""
+        if llm_type not in self.windows:
+            return
+        
+        stats = self.windows[llm_type]['stats']
+        for key, value in kwargs.items():
+            if key in stats:
+                if key in ['message_count', 'total_tokens', 'input_tokens', 'output_tokens']:
+                    stats[key] += value
+                elif key == 'estimated_cost':
+                    stats[key] += value
+                else:
+                    stats[key] = value
     
-    def supports_tools(self) -> bool:
-        """Gemini supports function calling for Pro and Ultra models"""
-        return 'pro' in self.model_name.lower() or 'ultra' in self.model_name.lower()
+    def scroll(self, llm_type: LLMType, direction: str, amount: int = 5):
+        """Scroll a specific window"""
+        if llm_type not in self.windows:
+            return
+        
+        if direction == 'up':
+            self.windows[llm_type]['scroll_offset'] += amount
+            max_scroll = max(0, len(self.windows[llm_type]['lines']) - 10)
+            self.windows[llm_type]['scroll_offset'] = min(
+                self.windows[llm_type]['scroll_offset'], max_scroll)
+        elif direction == 'down':
+            self.windows[llm_type]['scroll_offset'] -= amount
+            self.windows[llm_type]['scroll_offset'] = max(
+                0, self.windows[llm_type]['scroll_offset'])
+        elif direction == 'reset':
+            self.windows[llm_type]['scroll_offset'] = 0
     
-    def format_tool_response(self, tool_call_id: str, tool_result: Any) -> Dict[str, Any]:
-        """Format tool response for Gemini"""
-        # Gemini expects tool results as regular messages
-        return {
-            "role": "user",
-            "content": f"Function {tool_call_id} returned: {json.dumps(tool_result) if not isinstance(tool_result, str) else tool_result}"
+    def set_active_window(self, llm_type: LLMType):
+        """Set the active window"""
+        if llm_type in self.windows:
+            self.active_window = llm_type
+    
+    def refresh_display(self):
+        """Refresh the entire multi-window display"""
+        term_width, term_height = self.get_terminal_size()
+        
+        # Check for resize
+        if self.last_terminal_size != (term_width, term_height):
+            self.clear_screen()
+            self.last_terminal_size = (term_width, term_height)
+        
+        # Calculate layout
+        layout = self.calculate_layout(term_height, term_width)
+        
+        # Draw each window
+        for i, window_info in enumerate(layout['windows']):
+            self.draw_window(window_info, term_width)
+            
+            # Draw divider if not last window
+            if i < len(layout['windows']) - 1:
+                divider_row = window_info['start_row'] + window_info['total_height']
+                self.draw_divider(divider_row, term_width)
+        
+        # FIX: Draw status line above input prompt
+        if self.status_message:
+            status_row = layout['input_row'] - 2
+            self.move_cursor(status_row, 1)
+            # Clear the line first
+            print(" " * term_width)
+            self.move_cursor(status_row, 1)
+            # Print status with formatting
+            status_text = f"{Colors.YELLOW}[{self.status_message}]{Colors.RESET}"
+            if len(status_text) > term_width - 2:
+                status_text = status_text[:term_width - 5] + "..."
+            print(status_text)
+        
+        # Position cursor for input
+        self.move_cursor(layout['input_row'], 1)
+        print(f"{Colors.GREEN}You: {Colors.RESET}", end='')
+        sys.stdout.flush()
+    
+    def clear_all(self):
+        """Clear all windows"""
+        for llm_type in self.windows:
+            self.windows[llm_type]['lines'] = []
+            self.windows[llm_type]['scroll_offset'] = 0
+            self.windows[llm_type]['stats'] = self._init_stats(llm_type)
+    
+    def show_statistics(self, stats: Dict[str, Any]):
+        """Display statistics in the main window"""
+        self.add_message("system", "Session Statistics", "system")
+        self.add_line(self.main_llm, "=" * 50)
+        self.add_line(self.main_llm, f"Total messages: {stats['total_messages']}")
+        self.add_line(self.main_llm, f"Total tokens: {stats['total_tokens']:,}")
+        self.add_line(self.main_llm, f"Total cost: ${stats['total_cost']:.4f}")
+        self.add_line(self.main_llm, f"Duration: {stats['session_duration_minutes']:.1f} minutes")
+        
+        if 'llm_stats' in stats:
+            self.add_line(self.main_llm, "")
+            self.add_message("system", "Per-Model Statistics", "system")
+            for llm_name, llm_stats in stats['llm_stats'].items():
+                if llm_stats.get('message_count', 0) > 0:
+                    self.add_line(self.main_llm, f"\n{llm_name}:")
+                    self.add_line(self.main_llm, f"  Messages: {llm_stats['message_count']}")
+                    self.add_line(self.main_llm, f"  Tokens: {llm_stats.get('total_tokens', 0):,}")
+                    self.add_line(self.main_llm, f"  Cost: ${llm_stats.get('total_cost', 0):.4f}")
+        self.add_line(self.main_llm, "=" * 50)
+
+
+class MultiPaneUI(BaseTerminalUI):
+    """Advanced multi-pane terminal UI with sub-agent visualization - Compact version"""
+    
+    def __init__(self, main_llm: LLMType, sub_llms: List[LLMType], config: Dict[str, Any]):
+        super().__init__()
+        self.main_llm = main_llm
+        self.sub_llms = sub_llms
+        self.config = config
+        
+        # Main conversation window
+        self.main_window = {
+            'lines': [],
+            'stats': self._init_stats(main_llm),
+            'scroll_offset': 0
         }
+        
+        # Sub-agent panes
+        self.sub_panes = {}
+        for llm in sub_llms:
+            self.sub_panes[llm] = {
+                'query': 'No activity yet.',
+                'response': '',
+                'timestamp': None,
+                'status': 'idle',  # idle, processing, complete, error
+                'stats': self._init_stats(llm)
+            }
+        
+        self.max_lines = 3000
+        self.show_sub_panes = config.get('SHOW_SUB_AGENT_PANES', True)
+        
+    def _init_stats(self, llm_type: LLMType) -> Dict[str, Any]:
+        """Initialize stats for an LLM"""
+        return {
+            'message_count': 0,
+            'total_tokens': 0,
+            'input_tokens': 0,
+            'output_tokens': 0,
+            'estimated_cost': 0.0,
+            'last_model': self.config.get('SELECTED_MODELS', {}).get(llm_type, 'unknown')
+        }
+    
+    def calculate_pane_layout(self, term_width: int, term_height: int) -> Dict[str, Any]:
+        """Calculate layout for sub-agent panes"""
+        if not self.show_sub_panes or not self.sub_llms:
+            return {
+                'show_panes': False,
+                'main_start': 1,
+                'main_height': term_height - 2 - (1 if self.status_message else 0)  # FIX: Account for status
+            }
+        
+        # Calculate pane dimensions
+        num_panes = len(self.sub_llms)
+        pane_height = min(15, max(10, term_height // 4))
+        pane_width = term_width // num_panes
+        
+        # FIX: Account for status line
+        status_lines = 1 if self.status_message else 0
+        
+        return {
+            'show_panes': True,
+            'pane_height': pane_height,
+            'pane_width': pane_width,
+            'main_start': pane_height + 2,
+            'main_height': term_height - pane_height - 3 - status_lines
+        }
+    
+    def draw_sub_pane(self, llm_type: LLMType, col_start: int, pane_width: int, pane_height: int):
+        """Draw a single sub-agent pane"""
+        pane = self.sub_panes[llm_type]
+        colors = LLM_COLORS[llm_type]
+        
+        # Draw pane border and title
+        title = f" {colors['icon']} {llm_type.value.upper()} "
+        if pane['status'] == 'processing':
+            title += "[PROCESSING] "
+        elif pane['status'] == 'error':
+            title += "[ERROR] "
+        
+        # Top border
+        self.move_cursor(1, col_start)
+        border_color = Colors.BRIGHT_YELLOW if pane['status'] == 'processing' else Colors.BLUE
+        print(f"{border_color}{BoxChars.TL}{title.center(pane_width - 2, BoxChars.H)}{BoxChars.TR}{Colors.RESET}")
+        
+        # Query section
+        inner_width = pane_width - 4
+        query_lines = textwrap.wrap(f"Q: {pane['query']}", width=inner_width)[:3]
+        
+        row = 2
+        for line in query_lines:
+            self.move_cursor(row, col_start)
+            print(f"{border_color}{BoxChars.V}{Colors.RESET} {Colors.YELLOW}{line[:inner_width].ljust(inner_width)}{Colors.RESET} {border_color}{BoxChars.V}{Colors.RESET}")
+            row += 1
+        
+        # Fill empty query rows
+        while row < 5:
+            self.move_cursor(row, col_start)
+            print(f"{border_color}{BoxChars.V}{Colors.RESET} {' ' * inner_width} {border_color}{BoxChars.V}{Colors.RESET}")
+            row += 1
+        
+        # Separator
+        self.move_cursor(row, col_start)
+        print(f"{border_color}{BoxChars.L}{BoxChars.H * (pane_width - 2)}{BoxChars.R}{Colors.RESET}")
+        row += 1
+        
+        # Response section
+        response_color = Colors.GREEN if pane['status'] == 'complete' else Colors.RED if pane['status'] == 'error' else Colors.WHITE
+        response_text = pane['response'] if pane['response'] else '[Waiting...]' if pane['status'] == 'processing' else ''
+        response_lines = textwrap.wrap(f"A: {response_text}", width=inner_width)[:(pane_height - row - 2)]
+        
+        for line in response_lines:
+            self.move_cursor(row, col_start)
+            print(f"{border_color}{BoxChars.V}{Colors.RESET} {response_color}{line[:inner_width].ljust(inner_width)}{Colors.RESET} {border_color}{BoxChars.V}{Colors.RESET}")
+            row += 1
+        
+        # Fill empty response rows
+        while row < pane_height - 1:
+            self.move_cursor(row, col_start)
+            print(f"{border_color}{BoxChars.V}{Colors.RESET} {' ' * inner_width} {border_color}{BoxChars.V}{Colors.RESET}")
+            row += 1
+        
+        # Stats row
+        self.move_cursor(row, col_start)
+        stats = pane['stats']
+        stats_text = f"T:{stats['total_tokens']} $:{stats['estimated_cost']:.3f}"
+        if len(stats_text) > inner_width:
+            stats_text = f"${stats['estimated_cost']:.3f}"
+        print(f"{border_color}{BoxChars.V}{Colors.RESET} {Colors.DIM}{stats_text.ljust(inner_width)}{Colors.RESET} {border_color}{BoxChars.V}{Colors.RESET}")
+        row += 1
+        
+        # Bottom border
+        self.move_cursor(row, col_start)
+        print(f"{border_color}{BoxChars.BL}{BoxChars.H * (pane_width - 2)}{BoxChars.BR}{Colors.RESET}")
+    
+    def draw_main_conversation(self, start_row: int, height: int, width: int):
+        """Draw the main conversation pane with compact header"""
+        colors = LLM_COLORS[self.main_llm]
+        stats = self.main_window['stats']
+        
+        # Compact header - all info on one line
+        self.move_cursor(start_row, 1)
+        
+        # Build header components
+        title = f" {colors['icon']} {self.main_llm.value.upper()}"
+        model = stats['last_model']
+        if len(model) > 20:
+            model = model[:17] + "..."
+        
+        # Compact stats
+        msg = f"M:{stats['message_count']}"
+        tok = f"T:{stats['total_tokens']:,}"
+        if stats['total_tokens'] >= 1000000:
+            tok = f"T:{stats['total_tokens']/1000000:.1f}M"
+        elif stats['total_tokens'] >= 1000:
+            tok = f"T:{stats['total_tokens']/1000:.0f}k"
+        
+        cost = f"${stats['estimated_cost']:.3f}"
+        
+        # Add scroll indicator
+        scroll = ""
+        if self.main_window.get('scroll_offset', 0) > 0:
+            scroll = " [SCROLL]"
+        
+        # Build complete header line
+        stats_text = f" {msg} {tok} {cost}{scroll} "
+        model_text = f" [{model}]"
+        
+        # Calculate spacing
+        total_fixed_width = len(title) + len(model_text) + len(stats_text)
+        spacing = max(1, width - total_fixed_width)
+        
+        if spacing > 0:
+            header_line = f"{title}{model_text}{' ' * spacing}{stats_text}"
+        else:
+            # Not enough space, skip model
+            header_line = f"{title} {msg} {tok} {cost}{scroll} "
+        
+        # Ensure it fits
+        if len(header_line) > width:
+            header_line = header_line[:width]
+        else:
+            header_line = header_line.ljust(width)
+        
+        print(f"{colors['bg']}{Colors.BOLD}{Colors.WHITE}{header_line}{Colors.RESET}")
+        
+        # Content area
+        content_start = start_row + 2  # Only 2 rows for header (title + separator)
+        content_height = height - 3
+        
+        # Separator line
+        self.move_cursor(start_row + 1, 1)
+        print(f"{Colors.BLUE}{'─' * width}{Colors.RESET}")
+        
+        # Get visible lines
+        lines = self.main_window['lines']
+        scroll_offset = self.main_window.get('scroll_offset', 0)
+        
+        total_lines = len(lines)
+        if scroll_offset > 0:
+            start_idx = max(0, total_lines - content_height - scroll_offset)
+            end_idx = max(0, total_lines - scroll_offset)
+        else:
+            start_idx = max(0, total_lines - content_height)
+            end_idx = total_lines
+        
+        display_lines = lines[start_idx:end_idx]
+        
+        # Clear and draw content
+        for i in range(content_height):
+            self.move_cursor(content_start + i, 1)
+            if i < len(display_lines):
+                line = display_lines[i]
+                if len(line) > width - 2:
+                    line = line[:width - 5] + "..."
+                print(f" {line}" + " " * (width - len(line) - 2))
+            else:
+                print(" " * width)
+        
+        # Bottom border
+        self.move_cursor(start_row + height - 1, 1)
+        print(f"{Colors.BLUE}{'─' * width}{Colors.RESET}")
+    
+    def update_sub_pane(self, llm_type: LLMType, query: str = None, response: str = None, 
+                       status: str = None, stats_update: Dict[str, Any] = None):
+        """Update sub-agent pane content"""
+        if llm_type not in self.sub_panes:
+            return
+        
+        pane = self.sub_panes[llm_type]
+        
+        if query is not None:
+            pane['query'] = query
+            pane['timestamp'] = datetime.now()
+        
+        if response is not None:
+            pane['response'] = response
+        
+        if status is not None:
+            pane['status'] = status
+        
+        if stats_update:
+            stats = pane['stats']
+            for key, value in stats_update.items():
+                if key in ['message_count', 'total_tokens', 'input_tokens', 'output_tokens']:
+                    stats[key] += value
+                elif key == 'estimated_cost':
+                    stats[key] += value
+                else:
+                    stats[key] = value
+    
+    def add_line(self, line: str):
+        """Add line to main conversation window"""
+        if '\n' in line:
+            for sub_line in line.split('\n'):
+                if sub_line:
+                    self.add_line(sub_line)
+            return
+        
+        # Get terminal width for wrapping
+        term_width, _ = self.get_terminal_size()
+        max_width = max(40, term_width - 4)
+        
+        # Apply truncation if verbose is off
+        if not self.config.get('VERBOSE_DISPLAY', True) and len(line) > max_width * 2:
+            line = line[:max_width * 2 - 3] + "..."
+        
+        # Wrap long lines
+        if len(line) > max_width:
+            wrapped_lines = textwrap.wrap(
+                line,
+                width=max_width,
+                break_long_words=True,
+                break_on_hyphens=True
+            )
+            for wrapped_line in wrapped_lines:
+                self.main_window['lines'].append(wrapped_line)
+        else:
+            self.main_window['lines'].append(line)
+        
+        # Reset scroll offset
+        self.main_window['scroll_offset'] = 0
+        
+        # Limit history
+        while len(self.main_window['lines']) > self.max_lines:
+            self.main_window['lines'].pop(0)
+    
+    def add_message(self, source: str, message: str, message_type: str = "info"):
+        """Add a message to the main conversation"""
+        timestamp = ""
+        if self.config.get('SHOW_TIMESTAMPS', True):
+            timestamp = datetime.now().strftime("[%H:%M:%S] ")
+        
+        # Format message based on type
+        if message_type == "user":
+            formatted = f"{timestamp}{Colors.GREEN}{Colors.BOLD}You:{Colors.RESET} {message}"
+        elif message_type == "assistant":
+            formatted = f"{timestamp}{Colors.CYAN}{Colors.BOLD}{source}:{Colors.RESET} {message}"
+        elif message_type == "error":
+            formatted = f"{timestamp}{Colors.RED}{Colors.BOLD}Error:{Colors.RESET} {message}"
+        elif message_type == "system":
+            formatted = f"{timestamp}{Colors.YELLOW}{message}{Colors.RESET}"
+        elif message_type == "tool":
+            formatted = f"{timestamp}{Colors.MAGENTA}🔧 {message}{Colors.RESET}"
+        elif message_type == "thinking":
+            formatted = f"{timestamp}{Colors.DIM}{message}{Colors.RESET}"
+        else:
+            formatted = f"{timestamp}{message}"
+        
+        self.add_line(formatted)
+    
+    def update_main_stats(self, **kwargs):
+        """Update main window statistics"""
+        stats = self.main_window['stats']
+        for key, value in kwargs.items():
+            if key in stats:
+                if key in ['message_count', 'total_tokens', 'input_tokens', 'output_tokens']:
+                    stats[key] += value
+                elif key == 'estimated_cost':
+                    stats[key] += value
+                else:
+                    stats[key] = value
+    
+    def scroll(self, direction: str, amount: int = 5):
+        """Scroll the main conversation window"""
+        if direction == 'up':
+            self.main_window['scroll_offset'] += amount
+            max_scroll = max(0, len(self.main_window['lines']) - 10)
+            self.main_window['scroll_offset'] = min(
+                self.main_window['scroll_offset'], max_scroll)
+        elif direction == 'down':
+            self.main_window['scroll_offset'] -= amount
+            self.main_window['scroll_offset'] = max(
+                0, self.main_window['scroll_offset'])
+        elif direction == 'reset':
+            self.main_window['scroll_offset'] = 0
+    
+    def toggle_sub_panes(self):
+        """Toggle sub-agent panes visibility"""
+        self.show_sub_panes = not self.show_sub_panes
+        self.clear_screen()
+    
+    def refresh_display(self):
+        """Refresh the entire multi-pane display"""
+        term_width, term_height = self.get_terminal_size()
+        
+        # Check for resize
+        if self.last_terminal_size != (term_width, term_height):
+            self.clear_screen()
+            self.last_terminal_size = (term_width, term_height)
+        
+        # Calculate layout
+        layout = self.calculate_pane_layout(term_width, term_height)
+        
+        # Draw sub-agent panes if enabled
+        if layout['show_panes']:
+            for i, llm_type in enumerate(self.sub_llms):
+                col_start = i * layout['pane_width'] + 1
+                self.draw_sub_pane(llm_type, col_start, layout['pane_width'], layout['pane_height'])
+        
+        # Draw main conversation
+        self.draw_main_conversation(
+            layout['main_start'],
+            layout['main_height'],
+            term_width
+        )
+        
+        # FIX: Draw status line above input prompt
+        if self.status_message:
+            status_row = term_height - 2
+            self.move_cursor(status_row, 1)
+            # Clear the line
+            print(" " * term_width)
+            self.move_cursor(status_row, 1)
+            # Print status with formatting
+            status_text = f"{Colors.YELLOW}[{self.status_message}]{Colors.RESET}"
+            if len(status_text) > term_width - 2:
+                status_text = status_text[:term_width - 5] + "..."
+            print(status_text)
+        
+        # Position cursor for input
+        self.move_cursor(term_height, 1)
+        print(f"{Colors.GREEN}You: {Colors.RESET}", end='')
+        sys.stdout.flush()
+    
+    def clear_all(self):
+        """Clear all windows and panes"""
+        self.main_window['lines'] = []
+        self.main_window['scroll_offset'] = 0
+        self.main_window['stats'] = self._init_stats(self.main_llm)
+        
+        for llm_type in self.sub_panes:
+            self.sub_panes[llm_type] = {
+                'query': 'No activity yet.',
+                'response': '',
+                'timestamp': None,
+                'status': 'idle',
+                'stats': self._init_stats(llm_type)
+            }
+    
+    def show_statistics(self, overall_stats: Dict[str, Any]):
+        """Display statistics in the main window"""
+        self.add_line("")
+        self.add_message("system", "Session Statistics", "system")
+        self.add_line("=" * 50)
+        self.add_line(f"Total messages: {overall_stats['total_messages']}")
+        self.add_line(f"Total tokens: {overall_stats['total_tokens']:,}")
+        self.add_line(f"Total cost: ${overall_stats['total_cost']:.4f}")
+        self.add_line(f"Duration: {overall_stats['session_duration_minutes']:.1f} minutes")
+        
+        if 'llm_stats' in overall_stats:
+            self.add_line("")
+            self.add_message("system", "Per-Model Statistics", "system")
+            for llm_name, llm_stats in overall_stats['llm_stats'].items():
+                if llm_stats.get('message_count', 0) > 0:
+                    self.add_line(f"\n{llm_name}:")
+                    self.add_line(f"  Messages: {llm_stats['message_count']}")
+                    self.add_line(f"  Tokens: {llm_stats.get('total_tokens', 0):,}")
+                    self.add_line(f"  Cost: ${llm_stats.get('total_cost', 0):.4f}")
+        self.add_line("=" * 50)
 
 
-# Factory function to create interfaces
-def create_llm_interface(provider: str, api_key: str, model: str) -> LLMInterface:
-    """Factory function to create the appropriate LLM interface"""
-    if provider.lower() in ['claude', 'anthropic']:
-        return ClaudeInterface(api_key, model)
-    elif provider.lower() in ['openai', 'gpt']:
-        return OpenAIInterface(api_key, model)
-    elif provider.lower() in ['gemini', 'google']:
-        return GeminiInterface(api_key, model)
+# Helper function to add message with status updates
+def add_message_with_status(ui: BaseTerminalUI, source: str, message: str, message_type: str = "info"):
+    """Helper to add message and handle status updates"""
+    # FIX: Extract status messages that shouldn't appear in chat
+    status_keywords = [
+        "responding `tool_result` block",
+        "processing tool call",
+        "waiting for response",
+        "executing tool:",
+        "[thinking]",
+        "self-query in progress"
+    ]
+    
+    # Check if this is a status message
+    is_status = any(keyword in message.lower() for keyword in status_keywords)
+    
+    if is_status:
+        # Set as status instead of adding to chat
+        ui.set_status(message)
     else:
-        raise ValueError(f"Unknown provider: {provider}")
+        # Add to chat normally
+        ui.add_message(source, message, message_type)
+        # Clear any previous status
+        ui.clear_status()
 
 
-# Utility functions for model information
-def get_model_info(model: str) -> Dict[str, Any]:
-    """Get detailed information about a model"""
-    info = {
-        'name': model,
-        'provider': 'unknown',
-        'family': 'unknown',
-        'context_window': 'unknown',
-        'pricing': PRICE_MAPPING.get(model, {'input': 0, 'output': 0}),
-        'supports_tools': False,
-        'description': ''
+# Factory function to create appropriate UI
+def create_ui(display_mode: str, main_llm: LLMType, sub_llms: List[LLMType], config: Dict[str, Any]) -> BaseTerminalUI:
+    """Create the appropriate UI based on display mode"""
+    if display_mode == "multi-window":
+        return MultiWindowUI(main_llm, sub_llms, config)
+    elif display_mode == "multi-pane":
+        return MultiPaneUI(main_llm, sub_llms, config)
+    else:
+        return StandardUI(config)
+
+
+# Progress indicator for long operations
+class ProgressIndicator:
+    """Simple progress indicator for terminal"""
+    
+    def __init__(self, message: str = "Processing"):
+        self.message = message
+        self.symbols = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self.current = 0
+        self.active = False
+    
+    def start(self):
+        """Start the progress indicator"""
+        self.active = True
+        self._update()
+    
+    def stop(self):
+        """Stop the progress indicator"""
+        self.active = False
+        print("\r" + " " * (len(self.message) + 10) + "\r", end='')
+        sys.stdout.flush()
+    
+    def _update(self):
+        """Update the progress indicator"""
+        if self.active:
+            symbol = self.symbols[self.current % len(self.symbols)]
+            print(f"\r{symbol} {self.message}...", end='')
+            sys.stdout.flush()
+            self.current += 1
+
+
+# Utility function for terminal capabilities check
+def check_terminal_capabilities() -> Dict[str, bool]:
+    """Check terminal capabilities"""
+    capabilities = {
+        'color': True,  # Most modern terminals support color
+        'unicode': True,  # Most modern terminals support Unicode
+        'size': True  # Can get terminal size
     }
     
-    # Determine provider and characteristics
-    if 'claude' in model:
-        info['provider'] = 'anthropic'
-        info['supports_tools'] = True
-        
-        if 'opus' in model:
-            info['family'] = 'opus'
-            info['context_window'] = '200K'
-            info['description'] = 'Most capable, best for complex tasks'
-        elif 'sonnet' in model:
-            info['family'] = 'sonnet'
-            info['context_window'] = '200K'
-            info['description'] = 'Balanced performance and cost'
-        elif 'haiku' in model:
-            info['family'] = 'haiku'
-            info['context_window'] = '200K'
-            info['description'] = 'Fast and cost-effective'
-            
-    elif any(prefix in model for prefix in ['gpt', 'o1', 'o3']):
-        info['provider'] = 'openai'
-        
-        if 'gpt-4' in model:
-            info['family'] = 'gpt-4'
-            info['supports_tools'] = True
-            if '32k' in model:
-                info['context_window'] = '32K'
-            elif 'turbo' in model and '128k' in model:
-                info['context_window'] = '128K'
-            else:
-                info['context_window'] = '8K'
-            
-            if 'turbo' in model:
-                info['description'] = 'Faster GPT-4 with improved capabilities'
-            elif 'o' in model:
-                info['description'] = 'Multimodal GPT-4 with vision'
-            else:
-                info['description'] = 'Original GPT-4, highly capable'
-                
-        elif 'gpt-3.5' in model:
-            info['family'] = 'gpt-3.5'
-            info['supports_tools'] = True
-            info['context_window'] = '16K' if '16k' in model else '4K'
-            info['description'] = 'Fast and cost-effective'
-            
-        elif 'o1' in model:
-            info['family'] = 'o1'
-            info['supports_tools'] = False  # O1 doesn't support tools yet
-            info['context_window'] = '128K'
-            if 'mini' in model:
-                info['description'] = 'Reasoning model, cost-effective'
-            else:
-                info['description'] = 'Advanced reasoning and problem-solving'
-                
-    elif 'gemini' in model:
-        info['provider'] = 'google'
-        
-        if 'ultra' in model:
-            info['family'] = 'ultra'
-            info['supports_tools'] = True
-            info['context_window'] = '1M'
-            info['description'] = 'Most capable Gemini model'
-        elif 'pro' in model:
-            info['family'] = 'pro'
-            info['supports_tools'] = True
-            info['context_window'] = '1M' if '1.5' in model else '32K'
-            info['description'] = 'Advanced reasoning with long context'
-        elif 'flash' in model:
-            info['family'] = 'flash'
-            info['supports_tools'] = True
-            info['context_window'] = '1M' if '1.5' in model else '32K'
-            info['description'] = 'Fast and efficient'
-        
-        if '2.0' in model:
-            info['description'] += ' (Latest generation)'
+    # Check if running in a basic terminal
+    term = os.environ.get('TERM', '')
+    if term in ['dumb', 'unknown']:
+        capabilities['color'] = False
+        capabilities['unicode'] = False
     
-    return info
-
-
-def format_model_comparison(models: List[str]) -> str:
-    """Format a comparison table of models"""
-    lines = []
-    lines.append("\n📊 Model Comparison:")
-    lines.append("=" * 100)
-    lines.append(f"{'Model':<40} {'Context':<10} {'Input $/1M':<12} {'Output $/1M':<12} {'Features':<20}")
-    lines.append("-" * 100)
+    # Check if running in Windows console (older versions)
+    if os.name == 'nt':
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            # Enable virtual terminal processing for Windows 10+
+            kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+        except:
+            pass
     
-    for model in models:
-        info = get_model_info(model)
-        pricing = info['pricing']
-        features = []
-        if info['supports_tools']:
-            features.append("Tools")
-        if 'vision' in model or 'o' in model:
-            features.append("Vision")
-        if info['family'] in ['o1', 'opus', 'ultra']:
-            features.append("Advanced")
-        
-        lines.append(
-            f"{model:<40} {info['context_window']:<10} "
-            f"${pricing['input']:<11.2f} ${pricing['output']:<11.2f} "
-            f"{', '.join(features):<20}"
-        )
+    # Test Unicode support
+    try:
+        test_char = "█"
+        test_char.encode(sys.stdout.encoding or 'utf-8')
+    except:
+        capabilities['unicode'] = False
     
-    lines.append("=" * 100)
-    return '\n'.join(lines)
+    return capabilities
